@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.crawlspace/
+.env
+*.log
+.npm-cache/
