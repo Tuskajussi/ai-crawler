@@ -1,0 +1,11 @@
+.git
+node_modules
+.npm-cache
+.crawlspace
+dist
+dist-server
+.env
+.env.*
+!.env.example
+*.log
+coverage

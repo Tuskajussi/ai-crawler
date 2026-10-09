@@ -5,7 +5,7 @@ export class InputError extends Error {
 }
 
 const identifier = /^[a-zA-Z0-9_-]{1,100}$/;
-const roles = new Set(['crawler', 'tester', 'designer', 'reviewer', 'coordinator', 'custom']);
+const roles = new Set(['crawler', 'tester', 'designer', 'reviewer', 'coordinator', 'judge', 'custom']);
 
 function text(value: unknown, label: string, maximum = 20_000, allowEmpty = true): asserts value is string {
   if (typeof value !== 'string' || value.length > maximum || (!allowEmpty && !value.trim())) {
@@ -45,6 +45,7 @@ export function validateModels(input: unknown): asserts input is ModelConfig[] {
 export function traversalOrder(workflow: Workflow): string[] {
   const outgoing = new Map<string, string[]>();
   for (const edge of workflow.edges) {
+    if (edge.data?.loop === true) continue;
     const targets = outgoing.get(edge.source) ?? [];
     targets.push(edge.target);
     outgoing.set(edge.source, targets);
@@ -80,6 +81,7 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
     text(data.description, 'Agent description', 5000);
     text(data.persona, 'Agent persona');
     text(data.prompt, 'Agent prompt');
+    if (data.judgeRubric !== undefined) text(data.judgeRubric, 'Judge rubric');
     text(data.color, 'Agent color', 50, false);
     if (!roles.has(data.role)) throw new InputError(`Unsupported role on ${data.label}.`);
     if (!Array.isArray(data.tools) || data.tools.some(tool => !['read', 'screenshot'].includes(tool))) throw new InputError(`Invalid tools on ${data.label}.`);
@@ -95,15 +97,35 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
     edgeIds.add(edge.id);
     if (!ids.has(edge.source) || !ids.has(edge.target)) throw new InputError(`Connection ${edge.id} points to a missing agent.`);
     if (edge.label !== undefined) text(edge.label, 'Connection label', 200);
+    if (edge.data !== undefined && (!edge.data || typeof edge.data !== 'object' || Array.isArray(edge.data)
+      || (edge.data.loop !== undefined && typeof edge.data.loop !== 'boolean'))) throw new InputError(`Connection ${edge.id} must use a boolean loop flag.`);
   }
   const settings = workflow.settings;
   if (!settings || !['loop', 'once'].includes(settings.mode) || !['demo', 'pi'].includes(settings.executionMode)) throw new InputError('Invalid workflow execution settings.');
   if (settings.continuous !== undefined && typeof settings.continuous !== 'boolean') throw new InputError('Continuous crawling must be a boolean.');
+  if (settings.maxParallel !== undefined && (!Number.isInteger(settings.maxParallel) || settings.maxParallel < 1 || settings.maxParallel > 8)) throw new InputError('Parallel agents must be an integer from 1 to 8.');
   if (!Number.isInteger(settings.maxCycles) || settings.maxCycles < 1 || settings.maxCycles > 1000) throw new InputError('Maximum cycles must be an integer from 1 to 1,000.');
   if (!Number.isFinite(settings.intervalSeconds) || settings.intervalSeconds < 0 || settings.intervalSeconds > 86400) throw new InputError('Cycle interval must be from 0 to 86,400 seconds.');
   if (!ids.has(settings.entryNodeId)) throw new InputError('Choose an entry agent that exists in the workflow.');
   text(settings.projectPath, 'Project path', 4000);
   text(settings.previewUrl, 'Preview URL', 2000);
+  const remaining = new Map(workflow.nodes.map(node => [node.id, 0]));
+  const outgoing = new Map<string, string[]>();
+  for (const edge of workflow.edges.filter(item => item.data?.loop !== true)) {
+    remaining.set(edge.target, remaining.get(edge.target)! + 1);
+    outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge.target]);
+  }
+  const ready = workflow.nodes.filter(node => remaining.get(node.id) === 0).map(node => node.id);
+  for (let index = 0; index < ready.length; index++) {
+    for (const target of outgoing.get(ready[index]) ?? []) {
+      remaining.set(target, remaining.get(target)! - 1);
+      if (remaining.get(target) === 0) ready.push(target);
+    }
+  }
+  if (ready.length !== workflow.nodes.length) {
+    const labels = workflow.nodes.filter(node => remaining.get(node.id)! > 0).map(node => node.data.label);
+    throw new InputError(`Workflow contains an unmarked cycle involving ${labels.join(', ')}. Mark cycle-return connections as Next cycle (loop), or remove them. Normal connections must form an acyclic graph.`);
+  }
   const reachable = new Set(traversalOrder(workflow));
   const disconnected = workflow.nodes.filter(node => !reachable.has(node.id));
   if (disconnected.length) throw new InputError(`Connect all agents to the entry agent. Unreachable: ${disconnected.map(node => node.data.label).join(', ')}.`);

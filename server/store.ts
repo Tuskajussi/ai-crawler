@@ -35,7 +35,7 @@ export class StateStore {
         run.status = 'stopped';
         run.finishedAt = new Date().toISOString();
         run.error = 'The server restarted. Start a new run to continue.';
-        delete run.activeNodeId;
+        delete run.activeNodeId; delete run.activeNodeIds;
       }
     }
     for (const node of state.workflow.nodes) node.data.status = 'idle';
@@ -55,9 +55,9 @@ export class StateStore {
     this.state = next;
     const contents = JSON.stringify(next, null, 2);
     const write = this.writes.catch(() => {}).then(async () => {
-      await mkdir(path.dirname(this.filePath), { recursive: true });
+      await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const temporary = `${this.filePath}.tmp`;
-      await writeFile(temporary, contents, 'utf8');
+      await writeFile(temporary, contents, { encoding: 'utf8', mode: 0o600 });
       await rename(temporary, this.filePath);
     });
     this.writes = write;

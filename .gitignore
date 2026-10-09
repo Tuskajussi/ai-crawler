@@ -4,3 +4,5 @@ dist/
 .env
 *.log
 .npm-cache/
+
+dist-server

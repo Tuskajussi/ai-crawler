@@ -1,0 +1,27 @@
+[Unit]
+Description=Crawlspace workflow server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crawlspace
+Group=crawlspace
+WorkingDirectory=/opt/crawlspace
+EnvironmentFile=/etc/crawlspace/crawlspace.env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/crawlspace/browsers
+ExecStart=/usr/bin/node /opt/crawlspace/dist-server/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=crawlspace
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/crawlspace
+
+[Install]
+WantedBy=multi-user.target

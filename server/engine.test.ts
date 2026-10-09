@@ -23,7 +23,7 @@ test('graph traversal respects branches, joins, and cycles rather than node arra
     { id: 'c', source: 'reviewer', target: 'designer' },
     { id: 'd', source: 'tester', target: 'designer' },
     { id: 'e', source: 'designer', target: 'coordinator' },
-    { id: 'f', source: 'coordinator', target: 'crawler' },
+    { id: 'f', source: 'coordinator', target: 'crawler', data: { loop: true } },
   ];
   validateWorkflow(workflow, initialState.models);
   assert.deepEqual(traversalOrder(workflow), ['crawler', 'reviewer', 'tester', 'designer', 'coordinator']);
