@@ -52,6 +52,20 @@ test('preview URL allows explicit loopback hosts and rejects remote/credential U
   }
 });
 
+test('Code Mode accepts legacy workflows and explicit choices but rejects invalid settings', () => {
+  const workflow = structuredClone(initialState.workflow);
+  delete workflow.settings.codeMode;
+  validateWorkflow(workflow, initialState.models);
+  for (const codeMode of [true, false]) {
+    workflow.settings.codeMode = codeMode;
+    validateWorkflow(workflow, initialState.models);
+  }
+  for (const codeMode of ['false', 0, null]) {
+    const invalid = { ...workflow, settings: { ...workflow.settings, codeMode } };
+    assert.throws(() => validateWorkflow(invalid, initialState.models), /Code Mode must be a boolean/);
+  }
+});
+
 test('once mode executes each reachable agent once even with a return edge', async () => {
   const { store, cleanup } = await fixture();
   try {

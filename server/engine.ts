@@ -1,12 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode } from '../shared/types';
+import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode, RoutingAnswer, RoutingDecision, RoutingChoice } from '../shared/types';
 import { StateStore } from './store';
 import { InputError, traversalOrder, validateModels, validateWorkflow } from './validation';
+import { isEscalatableError } from './execution-errors';
+import { setMaxListeners } from 'node:events';
+import { EndpointLimiter, planWorkflow, type VisitComponent } from './scheduler';
+import { ROUTING_QUESTION_VERSION, routingModel, validateRoutingAnswer } from './routing';
 
 export interface AgentReport {
   findings?: { title: string; description: string; severity: Finding['severity']; file?: string; line?: number; screenshot?: string; demo?: boolean }[];
   messages?: { to: string; text: string }[];
   assignments?: { to: string; text: string }[];
+  escalation?: { reason: string };
+  execution?: { modelId: string; attempts: number; requests: number; durationMs: number; inputTokens: number; outputTokens: number };
 }
 export interface ExecutionContext {
   workflow: Workflow;
@@ -17,6 +23,8 @@ export interface ExecutionContext {
   messages: Message[];
   findings: Finding[];
   signal: AbortSignal;
+  escalation?: { reason: string; originalModelId: string };
+  onScreenshot?: (url: string) => void;
 }
 export type AgentExecutor = (context: ExecutionContext) => Promise<AgentReport>;
 
@@ -54,17 +62,35 @@ function demoReport(context: ExecutionContext): AgentReport {
 }
 
 export class WorkflowEngine {
-  private active: { id: string; controller: AbortController } | null = null;
+  private active: { id: string; controller: AbortController; task?: Promise<void>; stopping: boolean } | null = null;
   private pending = new Set<Promise<void>>();
+  private lifecycle: Promise<void> = Promise.resolve();
+  private screenshots = new Set<string>();
 
   constructor(
     private store: StateStore,
-    private options: { piExecutor?: AgentExecutor; demoStepMs?: number } = {},
+    private options: { piExecutor?: AgentExecutor; demoStepMs?: number; routingExecutor?: (context: ExecutionContext) => Promise<RoutingAnswer> } = {},
   ) {}
 
   get isRunning(): boolean { return this.active !== null; }
+  get pendingScreenshots(): string[] { return [...this.screenshots]; }
 
-  async start(mode?: 'demo' | 'pi'): Promise<Run> {
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycle.then(operation);
+    this.lifecycle = result.then(() => {}, () => {});
+    return result;
+  }
+
+  whenIdle<T>(operation: () => Promise<T>): Promise<T> {
+    return this.serialize(() => {
+      if (this.active) throw new InputError('Stop the active run before changing configuration.', 409);
+      return operation();
+    });
+  }
+
+  start(mode?: 'demo' | 'pi'): Promise<Run> { return this.serialize(() => this.startRun(mode)); }
+
+  private async startRun(mode?: 'demo' | 'pi'): Promise<Run> {
     if (this.active) throw new InputError('A run is already active. Stop it before starting another.', 409);
     const state = this.store.get();
     validateModels(state.models);
@@ -72,8 +98,9 @@ export class WorkflowEngine {
     const executionMode = mode ?? state.workflow.settings.executionMode;
     if (!['demo', 'pi'].includes(executionMode)) throw new InputError('Execution mode must be demo or pi.');
     const controller = new AbortController();
-    const run: Run = { id: randomUUID(), status: 'running', mode: executionMode, startedAt: new Date().toISOString(), cycle: 0, steps: 0 };
-    this.active = { id: run.id, controller };
+    const run: Run = { id: randomUUID(), status: 'running', mode: executionMode, startedAt: new Date().toISOString(), cycle: 0, steps: 0, escalations: 0 };
+    const active = { id: run.id, controller, stopping: false, task: undefined as Promise<void> | undefined };
+    this.active = active;
     try {
       await this.store.update(current => {
         current.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
@@ -88,6 +115,7 @@ export class WorkflowEngine {
       throw error;
     }
     const task = this.execute(structuredClone(state.workflow), structuredClone(state.models), run, controller.signal);
+    active.task = task;
     this.pending.add(task);
     void task.then(() => this.pending.delete(task), error => {
       this.pending.delete(task);
@@ -96,24 +124,41 @@ export class WorkflowEngine {
     return structuredClone(run);
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    // Abort immediately even while a prior start/stop operation is committing state.
+    if (this.active) { this.active.stopping = true; this.active.controller.abort(); }
+    return this.serialize(() => this.stopRun());
+  }
+
+  private async stopRun(): Promise<void> {
     const active = this.active;
     if (!active) return;
+    active.stopping = true;
     active.controller.abort();
-    this.active = null;
+    // A replacement run must never overlap the executor's asynchronous cleanup.
+    // A failed persistence operation must not prevent a later stop commit from recovering.
+    await active.task?.catch(() => {});
     await this.store.update(state => {
       const run = state.runs.find(item => item.id === active.id);
       if (run?.status === 'running') {
         run.status = 'stopped';
         run.finishedAt = new Date().toISOString();
         delete run.activeNodeId;
+        delete run.activeNodeIds;
+      }
+      for (const decision of run?.decisions ?? []) if (decision.status === 'pending') {
+        decision.status = 'cancelled'; decision.reason = 'The run stopped before the routing outcome could be saved.';
       }
       state.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
       this.message(state, active.id, 'system', 'all', 'Run stopped. Pending agent work and cycle timers have been cancelled.');
     });
+    if (this.active === active) this.active = null;
   }
 
-  async waitForIdle(): Promise<void> { await Promise.all([...this.pending]); }
+  async waitForIdle(): Promise<void> {
+    await this.lifecycle;
+    await Promise.all([...this.pending]);
+  }
 
   private message(state: AppState, runId: string, from: string, to: string, text: string, type: Message['type'] = 'system'): void {
     state.messages.push({ id: randomUUID(), runId, from, to, text, type, createdAt: new Date().toISOString() });
@@ -122,8 +167,14 @@ export class WorkflowEngine {
 
   private async execute(workflow: Workflow, models: ModelConfig[], run: Run, signal: AbortSignal): Promise<void> {
     const order = traversalOrder(workflow);
+    const workers = workflow.settings.maxParallelAgents ?? 1;
+    const routing = workflow.settings.routing;
+    const limiter = new EndpointLimiter([...models, ...(routing && routing.mode !== 'off' ? [routingModel(routing)] : [])], workers);
+    // Preserve the original breadth-first order unless parallel work is opted in.
+    const plan = workers === 1 ? order.map((id, index) => ({ id, nodeIds: [id], dependencies: index ? [order[index - 1]] : [] })) : planWorkflow(workflow);
     const continuous = workflow.settings.mode === 'loop' && workflow.settings.continuous === true;
     const cycles = workflow.settings.mode === 'once' ? 1 : workflow.settings.maxCycles;
+    let failedNodeId: string | undefined;
     try {
       for (let cycle = 1; continuous || cycle <= cycles; cycle++) {
         aborted(signal);
@@ -131,42 +182,19 @@ export class WorkflowEngine {
           aborted(signal);
           const current = state.runs.find(item => item.id === run.id)!;
           current.cycle = cycle;
+          delete current.activeNodeId;
+          delete current.activeNodeIds;
           state.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
           this.message(state, run.id, 'system', 'all', continuous
             ? `Cycle ${cycle} started. Continuous crawling stays active until you stop the run. Each reachable agent runs once in this cycle.`
             : `Cycle ${cycle} of ${cycles} started. Each reachable agent runs once in this cycle.`);
         });
-        for (const nodeId of order) {
-          aborted(signal);
-          const node = workflow.nodes.find(item => item.id === nodeId)!;
-          await this.store.update(state => {
-            aborted(signal);
-            state.runs.find(item => item.id === run.id)!.activeNodeId = node.id;
-            state.workflow.nodes.find(item => item.id === node.id)!.data.status = 'running';
-          });
-          const state = this.store.get();
-          const context: ExecutionContext = { workflow, models, node, run, cycle, messages: state.messages, findings: state.findings, signal };
-          let report: AgentReport;
-          if (run.mode === 'demo') {
-            await delay(this.options.demoStepMs ?? 1100, signal);
-            report = demoReport(context);
-          } else {
-            if (!this.options.piExecutor) throw new Error('Pi execution is unavailable. Install @earendil-works/pi-coding-agent and configure a model, or choose demo mode.');
-            report = await this.options.piExecutor(context);
-          }
-          aborted(signal);
-          await this.store.update(current => {
-            aborted(signal);
-            const currentRun = current.runs.find(item => item.id === run.id)!;
-            currentRun.steps++;
-            current.workflow.nodes.find(item => item.id === node.id)!.data.status = 'done';
-            this.applyReport(current, workflow, run, node, report);
-          });
-        }
+        await this.executeCycle(plan, workflow, models, run, cycle, limiter, signal, id => { failedNodeId = id; });
         if (continuous || cycle < cycles) {
           await this.store.update(state => {
             aborted(signal);
             delete state.runs.find(item => item.id === run.id)!.activeNodeId;
+            delete state.runs.find(item => item.id === run.id)!.activeNodeIds;
             this.message(state, run.id, 'system', 'all', `Cycle ${cycle} finished. Next cycle starts in ${workflow.settings.intervalSeconds}s.`);
           });
           await delay(workflow.settings.intervalSeconds * 1000, signal);
@@ -179,33 +207,285 @@ export class WorkflowEngine {
         current.status = 'completed';
         current.finishedAt = new Date().toISOString();
         delete current.activeNodeId;
+        delete current.activeNodeIds;
         this.message(state, run.id, 'system', 'all', `Run completed after ${cycles} cycle${cycles === 1 ? '' : 's'} and ${current.steps} agent steps.`);
       });
     } catch (error) {
       if (!signal.aborted) {
-        const message = error instanceof Error ? error.message : 'Unexpected agent execution failure.';
-        await this.store.update(state => {
-          const current = state.runs.find(item => item.id === run.id)!;
-          current.status = 'failed';
-          current.error = message;
-          current.finishedAt = new Date().toISOString();
-          const node = state.workflow.nodes.find(item => item.id === current.activeNodeId);
-          if (node) node.data.status = 'error';
-          delete current.activeNodeId;
-          this.message(state, run.id, 'system', 'all', `Run failed: ${message}`);
-        });
+        const message = error instanceof Error ? error.message.slice(0, 10_000) : 'Unexpected agent execution failure.';
+        try {
+          await this.store.update(state => {
+            const current = state.runs.find(item => item.id === run.id)!;
+            current.status = 'failed';
+            current.error = message;
+            current.finishedAt = new Date().toISOString();
+            for (const decision of current.decisions ?? []) if (decision.status === 'pending') {
+              decision.status = 'cancelled'; decision.reason = 'The run failed before the routing outcome could be saved.';
+            }
+            state.workflow.nodes.forEach(item => { if (item.data.status === 'running') item.data.status = 'idle'; });
+            const node = state.workflow.nodes.find(item => item.id === failedNodeId);
+            if (node) node.data.status = 'error';
+            delete current.activeNodeId;
+            delete current.activeNodeIds;
+            this.message(state, run.id, 'system', 'all', `Run failed: ${message}`);
+          });
+        } catch (storageError) {
+          // Keep edits/restarts locked until Stop can durably close the still-running record.
+          if (this.active?.id === run.id) this.active.stopping = true;
+          throw storageError;
+        }
       }
     } finally {
-      if (this.active?.id === run.id) this.active = null;
+      if (this.active?.id === run.id && !this.active.stopping) this.active = null;
     }
   }
 
-  private applyReport(state: AppState, workflow: Workflow, run: Run, node: WorkflowNode, report: AgentReport): void {
+  private async executeCycle(plan: VisitComponent[], workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, limiter: EndpointLimiter, runSignal: AbortSignal, failed: (id: string) => void): Promise<void> {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([runSignal, controller.signal]);
+    // A validated workflow can have 100 queued nodes plus active SDK listeners.
+    setMaxListeners(256, signal);
+    const completed = new Set<string>();
+    const launched = new Set<string>();
+    const running = new Map<string, Promise<void>>();
+    const allowance = { used: 0, decisions: 0 };
+    let failure: { error: unknown } | undefined;
+    const fail = (id: string, error: unknown) => {
+      if (failure || runSignal.aborted) return;
+      failure = { error };
+      failed(id);
+      controller.abort();
+    };
+    try {
+      while (completed.size < plan.length) {
+        aborted(runSignal);
+        if (failure) break;
+        for (const component of plan) {
+          if (launched.has(component.id) || !component.dependencies.every(id => completed.has(id))) continue;
+          launched.add(component.id);
+          const task = (async () => {
+            for (const id of component.nodeIds) {
+              aborted(signal);
+              try {
+                await this.executeNode(workflow, models, run, cycle, workflow.nodes.find(node => node.id === id)!, limiter, allowance, signal, error => fail(id, error));
+              } catch (error) { fail(id, error); throw error; }
+            }
+            completed.add(component.id);
+          })().catch(() => {}).finally(() => { running.delete(component.id); });
+          running.set(component.id, task);
+        }
+        if (!running.size) throw new Error('The workflow has no schedulable agents. Check its connections.');
+        await Promise.race(running.values());
+      }
+    } finally {
+      // Preserve the first failure and drain every sibling/queued visit before unlocking.
+      if (failure || runSignal.aborted) controller.abort();
+      await Promise.allSettled(running.values());
+    }
+    aborted(runSignal);
+    if (failure) throw failure.error;
+  }
+
+  private setNodeActive(state: AppState, runId: string, nodeId: string, active: boolean): void {
+    const run = state.runs.find(item => item.id === runId)!;
+    const ids = run.activeNodeIds ?? (run.activeNodeId ? [run.activeNodeId] : []);
+    run.activeNodeIds = active ? [...new Set([...ids, nodeId])] : ids.filter(id => id !== nodeId);
+    if (run.activeNodeIds.length) run.activeNodeId = run.activeNodeIds[0];
+    else { delete run.activeNodeId; delete run.activeNodeIds; }
+    const node = state.workflow.nodes.find(item => item.id === nodeId)!;
+    if (active) node.data.status = 'running';
+    else if (node.data.status === 'running') node.data.status = 'idle';
+  }
+
+  private async routeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { decisions: number }, signal: AbortSignal, fail: (error: unknown) => void): Promise<{ choice: 'assigned' | 'supervisor'; reason?: string }> {
+    const settings = workflow.settings.routing;
+    const assigned = models.find(model => model.id === node.data.modelId)!;
+    if (run.mode !== 'pi' || !settings || settings.mode === 'off' || assigned.kind !== 'local' || node.data.modelId === workflow.settings.supervisorModelId) return { choice: 'assigned' };
+    const supervisor = models.find(model => model.id === workflow.settings.supervisorModelId && model.enabled && model.id !== assigned.id);
+    const decision: RoutingDecision = {
+      id: randomUUID(), nodeId: node.id, cycle, createdAt: new Date().toISOString(), questionVersion: ROUTING_QUESTION_VERSION,
+      mode: settings.mode, backend: settings.backend, configuredModelId: settings.modelId, threshold: settings.confidenceThreshold, status: 'pending',
+    };
+    let recommendation: RoutingChoice = 'review';
+    let reason = '';
+    await limiter.run(routingModel(settings), signal, async () => {
+      try {
+        let exhausted = false;
+        await this.store.update(state => {
+          aborted(signal);
+          const current = state.runs.find(item => item.id === run.id)!;
+          exhausted = allowance.decisions >= settings.maxDecisionsPerCycle || (current.decisionCount ?? 0) >= settings.maxDecisionsPerRun;
+          if (exhausted) {
+            decision.status = 'budget';
+            decision.recommendation = 'review';
+            decision.reason = 'The decision allowance is exhausted. No classifier request was made.';
+            if (settings.mode === 'shadow') decision.selectedModelId = assigned.id;
+          } else {
+            allowance.decisions++;
+            current.decisionCount = (current.decisionCount ?? 0) + 1;
+          }
+          current.decisions = [...(current.decisions ?? []), structuredClone(decision)].slice(-500);
+        });
+        if (exhausted) {
+          reason = decision.reason!;
+          if (settings.mode === 'active') throw new Error(`${reason} Human review is required before more routing.`);
+          return;
+        }
+        let answer: RoutingAnswer | undefined;
+        let routingError: unknown;
+        const started = Date.now();
+        try {
+          if (!this.options.routingExecutor) throw new Error('Decision routing is unavailable. Configure a supported decision endpoint.');
+          const state = this.store.get();
+          answer = await this.options.routingExecutor({ workflow, models, node, run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, signal });
+          validateRoutingAnswer(answer);
+          aborted(signal);
+        } catch (error) { routingError = error; }
+        if (signal.aborted) {
+          decision.status = 'cancelled'; decision.reason = 'The run stopped before routing completed.';
+        } else if (routingError) {
+          decision.status = 'error';
+          // Transport errors may contain user data or credentials; retain a controlled reason.
+          decision.reason = 'The decision endpoint did not return a valid answer within its allowance.';
+          recommendation = supervisor ? 'supervisor' : 'review';
+        } else {
+          decision.status = 'completed';
+          decision.choice = answer!.choice; decision.probabilities = answer!.probabilities;
+          decision.confidence = answer!.confidence; decision.modelId = answer!.modelId; decision.inputTokens = answer!.inputTokens;
+          const confident = answer!.confidence >= settings.confidenceThreshold;
+          recommendation = confident && answer!.choice === 'assigned' ? 'assigned' : supervisor ? 'supervisor' : 'review';
+          decision.reason = confident && answer!.choice === 'assigned' ? 'The assigned worker meets the routing threshold.'
+            : confident && answer!.choice === 'supervisor' ? 'The decision model recommends stronger review.'
+            : 'The decision is uncertain or needs review; use the configured supervisor, otherwise request human review.';
+        }
+        decision.durationMs = Date.now() - started;
+        if (decision.status !== 'cancelled') {
+          decision.recommendation = recommendation;
+          if (settings.mode === 'shadow' || recommendation === 'assigned') decision.selectedModelId = assigned.id;
+        }
+        reason = decision.reason!;
+        await this.store.update(state => {
+          const current = state.runs.find(item => item.id === run.id)!;
+          const saved = current.decisions!.find(item => item.id === decision.id)!;
+          Object.assign(saved, structuredClone(decision));
+          this.message(state, run.id, 'system', 'all', `${settings.mode === 'shadow' ? 'Shadow routing' : 'Decision routing'} for ${node.data.label}: ${signal.aborted ? 'cancelled' : recommendation}. ${reason}${settings.mode === 'shadow' && !signal.aborted ? ' The assigned model stays in control.' : ''}`);
+        });
+        aborted(signal);
+        if (settings.mode === 'active' && recommendation === 'review') throw new Error(`${reason} Human review is required; no model was called.`);
+      } catch (error) { fail(error); throw error; }
+    });
+    return { choice: settings.mode === 'active' && (recommendation as RoutingChoice) === 'supervisor' ? 'supervisor' : 'assigned', reason };
+  }
+
+  private async executeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { used: number; decisions: number }, signal: AbortSignal, fail: (error: unknown) => void): Promise<void> {
+    const captures = new Set<string>();
+    const visit = async (visitNode: WorkflowNode, escalation?: ExecutionContext['escalation']): Promise<AgentReport> => {
+      const model = models.find(item => item.id === visitNode.data.modelId && item.enabled)!;
+      return limiter.run(model, signal, async () => {
+        try {
+          await this.store.update(state => { aborted(signal); this.setNodeActive(state, run.id, node.id, true); });
+          const state = this.store.get();
+          const context: ExecutionContext = { workflow, models, node: visitNode, run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, signal, escalation,
+            onScreenshot: url => { captures.add(url); this.screenshots.add(url); },
+          };
+          if (run.mode === 'demo') { await delay(this.options.demoStepMs ?? 1100, signal); return demoReport(context); }
+          if (!this.options.piExecutor) throw new Error('Pi execution is unavailable. Install @earendil-works/pi-coding-agent and configure a model, or choose demo mode.');
+          return await this.options.piExecutor(context);
+        } catch (error) {
+          const supervisorId = workflow.settings.supervisorModelId;
+          const canEscalate = !escalation && isEscalatableError(error) && supervisorId && supervisorId !== node.data.modelId && models.some(item => item.id === supervisorId && item.enabled);
+          // Abort siblings before releasing a failed visit's permit to queued work.
+          if (!canEscalate) fail(error);
+          throw error;
+        } finally {
+          // Terminal Stop/failure commits clear all activity after the workers drain.
+          if (!signal.aborted) {
+            try { await this.store.update(state => { aborted(signal); this.setNodeActive(state, run.id, node.id, false); }); }
+            catch (error) { fail(error); throw error; }
+          }
+        }
+      });
+    };
+    try {
+      const routing = await this.routeNode(workflow, models, run, cycle, node, limiter, allowance, signal, fail);
+      let report: AgentReport;
+      let escalationReason: string | undefined;
+      let originalError: unknown;
+      try {
+        if (routing.choice === 'supervisor') { report = { findings: [], messages: [], assignments: [] }; escalationReason = `Decision routing: ${routing.reason}`; }
+        else { report = await visit(node); escalationReason = report.escalation?.reason; }
+      }
+      catch (error) {
+        aborted(signal);
+        if (!isEscalatableError(error)) throw error;
+        originalError = error;
+        escalationReason = error instanceof Error ? error.message.slice(0, 2000) : 'The assigned model could not complete this review.';
+        report = { findings: [], messages: [], assignments: [] };
+      }
+      if (run.mode === 'pi' && escalationReason) {
+        const supervisorId = workflow.settings.supervisorModelId;
+        if (!supervisorId) {
+          await this.store.update(state => { aborted(signal); this.message(state, run.id, 'system', 'all', `${node.data.label} requested stronger review: ${escalationReason}. No supervisor is configured; no additional model was called.`); });
+          if (originalError) throw originalError;
+        } else {
+          const supervisor = models.find(model => model.id === supervisorId && model.enabled);
+          const supervisorError = !supervisor ? 'The configured supervisor model is unavailable. Choose an enabled model in workflow settings.'
+            : supervisorId === node.data.modelId ? 'The supervisor is already assigned to this agent; recursive escalation is not allowed.' : undefined;
+          if (supervisorError) {
+            await this.store.update(state => { aborted(signal); if (!originalError) this.applyReport(state, workflow, run, node, report, false); });
+            throw new Error(supervisorError);
+          }
+          const maximum = workflow.settings.maxEscalationsPerCycle ?? 1;
+          const maximumPerRun = workflow.settings.maxEscalationsPerRun ?? 10;
+          let allowanceError: string | undefined;
+          await this.store.update(state => {
+            aborted(signal);
+            const current = state.runs.find(item => item.id === run.id)!;
+            if (!originalError) this.applyReport(state, workflow, run, node, report, false);
+            if (allowance.used >= maximum) allowanceError = `The supervisor allowance of ${maximum} visit${maximum === 1 ? '' : 's'} per cycle is exhausted. Human review is required before further supervisor work.`;
+            else if ((current.escalations ?? 0) >= maximumPerRun) allowanceError = `The supervisor allowance of ${maximumPerRun} visit${maximumPerRun === 1 ? '' : 's'} per run is exhausted. Human review is required before further supervisor work.`;
+            if (allowanceError) { this.message(state, run.id, 'system', 'all', `${node.data.label} requested stronger review: ${escalationReason}. ${allowanceError}`); return; }
+            allowance.used++;
+            current.escalations = (current.escalations ?? 0) + 1;
+            if (routing.choice === 'supervisor') {
+              const decision = current.decisions?.slice().reverse().find(item => item.nodeId === node.id && item.cycle === cycle);
+              if (decision) decision.selectedModelId = supervisorId;
+            }
+            this.message(state, run.id, 'system', 'all', `Escalating ${node.data.label} to ${supervisor!.name}: ${escalationReason}. Used ${allowance.used} of ${maximum} supervisor visits this cycle and ${current.escalations} of ${maximumPerRun} this run.`);
+          });
+          if (allowanceError) throw new Error(allowanceError);
+          report = await visit({ ...node, data: { ...node.data, modelId: supervisorId } }, { reason: escalationReason, originalModelId: node.data.modelId });
+          if (report.escalation) throw new Error(`Supervisor ${supervisor!.name} requested further escalation: ${report.escalation.reason}. Further model calls are blocked; human review is required.`);
+        }
+      }
+      await this.store.update(state => {
+        aborted(signal);
+        state.runs.find(item => item.id === run.id)!.steps++;
+        state.workflow.nodes.find(item => item.id === node.id)!.data.status = 'done';
+        this.applyReport(state, workflow, run, node, report);
+      });
+    } finally { for (const url of captures) this.screenshots.delete(url); }
+  }
+
+  private applyReport(state: AppState, workflow: Workflow, run: Run, node: WorkflowNode, report: AgentReport, handoff = true): void {
+    if (report.execution) {
+      const execution = report.execution;
+      this.message(state, run.id, 'system', 'all', `Model ${execution.modelId} completed ${node.data.label}: ${execution.attempts} attempt(s), ${execution.requests} request(s), ${Math.round(execution.durationMs)}ms, ${execution.inputTokens} input and ${execution.outputTokens} output tokens.`);
+    }
     for (const finding of report.findings ?? []) {
-      // Repeated passes update the board only when there is a new observation.
+      // A recurring observation refreshes its evidence and reopens a resolved finding.
       const existing = state.findings.find(item => item.nodeId === node.id && item.title === finding.title
         && item.file === finding.file && Boolean(item.demo) === (run.mode === 'demo'));
-      if (existing) continue;
+      if (existing) {
+        existing.description = finding.description;
+        existing.severity = finding.severity;
+        if (finding.line !== undefined) existing.line = finding.line;
+        else delete existing.line;
+        if (finding.screenshot !== undefined) existing.screenshot = finding.screenshot;
+        else delete existing.screenshot;
+        if (existing.status === 'resolved') existing.status = 'open';
+        continue;
+      }
       state.findings.unshift({ ...finding, id: randomUUID(), nodeId: node.id, status: 'open', createdAt: new Date().toISOString(), demo: run.mode === 'demo' });
     }
     for (const message of report.messages ?? []) this.message(state, run.id, node.id, message.to, message.text, 'message');
@@ -213,7 +493,7 @@ export class WorkflowEngine {
       this.message(state, run.id, node.id, assignment.to, assignment.text, 'assignment');
     }
     const assigned = new Set((report.assignments ?? []).map(item => item.to));
-    for (const edge of workflow.edges.filter(item => item.source === node.id)) {
+    for (const edge of handoff ? workflow.edges.filter(item => item.source === node.id) : []) {
       if (!assigned.has(edge.target)) this.message(state, run.id, node.id, edge.target, `${node.data.label} completed its step. Continue with your responsibilities and the shared findings.`, 'assignment');
     }
     state.findings = state.findings.slice(0, 2000);

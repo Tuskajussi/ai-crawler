@@ -1,4 +1,9 @@
-import type { AppState, AgentData, AgentRole } from './types';
+import type { AppState, AgentData, AgentRole, RoutingSettings } from './types';
+export const defaultRoutingSettings: RoutingSettings = {
+ mode: 'off', backend: 'system-one', baseUrl: 'https://api.typesafe.ai/v1', modelId: 'jev-1.13.0', apiKeyEnv: 'TYPESAFE_API_KEY',
+ confidenceThreshold: 0.95, timeoutSeconds: 10, maxDecisionsPerCycle: 100, maxDecisionsPerRun: 1000,
+ maxConcurrentRequests: 1, contextWindow: 32768, temperature: 1,
+};
 export const roleMeta: Record<AgentRole, {label: string; color: string; description: string}> = {
   crawler: {label:'Code crawler', color:'green', description:'Finds what needs a closer look'},
   tester: {label:'Test engineer', color:'blue', description:'Looks for the unexpected'},
@@ -15,7 +20,7 @@ const stamp = new Date().toISOString();
 export const initialState: AppState = {
  workflow: {
   id:'quality-loop',name:'Codebase quality loop',description:'An always-curious team, keeping your code in good shape.',
-  settings:{mode:'loop',maxCycles:3,continuous:false,intervalSeconds:10,entryNodeId:'crawler',projectPath:'',previewUrl:'http://localhost:5173',executionMode:'demo'},
+  settings:{mode:'loop',maxCycles:3,continuous:false,intervalSeconds:10,entryNodeId:'crawler',projectPath:'',previewUrl:'http://localhost:5173',executionMode:'demo',codeMode:true,maxEscalationsPerCycle:1,maxEscalationsPerRun:10,maxParallelAgents:1},
   nodes:[
    {id:'crawler',type:'agent',position:{x:0,y:0},data:{...makeAgent('crawler'),label:'Scout',description:'Explore the codebase',responsibilities:['File discovery','Code smells','Potential bugs']}},
    {id:'tester',type:'agent',position:{x:330,y:0},data:{...makeAgent('tester','qwen'),label:'Test engineer',description:'Question every assumption',responsibilities:['Test coverage','Edge cases','Regression risks']}},

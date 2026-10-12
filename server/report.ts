@@ -37,5 +37,12 @@ export async function parseAgentReport(output: string, workflow: Workflow, proje
       return { to: item.to as string, text: item.text as string };
     });
   };
-  return { findings, messages: parseMessages(body.messages, 'messages'), assignments: parseMessages(body.assignments, 'assignments') };
+  let escalation: AgentReport['escalation'];
+  if (body.escalation !== undefined) {
+    if (!body.escalation || typeof body.escalation !== 'object' || Array.isArray(body.escalation)
+      || !validText((body.escalation as Record<string, unknown>).reason, 2000)
+      || Object.keys(body.escalation).some(key => key !== 'reason')) throw new Error('Agent escalation must contain only a reason of 1–2,000 characters.');
+    escalation = { reason: ((body.escalation as Record<string, unknown>).reason as string).trim() };
+  }
+  return { findings, messages: parseMessages(body.messages, 'messages'), assignments: parseMessages(body.assignments, 'assignments'), ...(escalation ? { escalation } : {}) };
 }
