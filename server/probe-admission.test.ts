@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createApp } from './index';
+import { authenticatedFixture, fixtureRegistrationSecret } from './test-auth';
 
 function deferred() {
   let resolve!: () => void;
@@ -23,10 +24,10 @@ async function until(condition: () => boolean, explanation: string) {
 async function fixture() {
   const directory = await mkdtemp(path.join(tmpdir(), 'crawlspace-probe-admission-'));
   const credentials = path.join(directory, 'credentials');
-  const runtime = await createApp({
+  const runtime = await authenticatedFixture(await createApp({ registrationSecret: fixtureRegistrationSecret,
     statePath: path.join(directory, 'state.json'), demoStepMs: 60_000,
     chatgptOptions: { credentialDirectory: credentials, fetch: async () => { throw new Error('Admission tests must never contact an external service.'); } },
-  });
+  }));
   await runtime.store.update(state => {
     const node = state.workflow.nodes[0];
     state.workflow.nodes = [node]; state.workflow.edges = [];
@@ -40,7 +41,7 @@ async function fixture() {
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
   const request = (route: string, body: unknown = {}) => fetch(`${base}${route}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...runtime.authHeaders }, body: JSON.stringify(body),
   });
   return {
     ...runtime, request, credentials,

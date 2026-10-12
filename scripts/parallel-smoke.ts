@@ -86,7 +86,17 @@ const servers = [0, 1].map(machine => createServer(async (request, response) => 
     response.flushHeaders(); event(response, { role: 'assistant' });
     const toolMessages = body.messages.filter((message: any) => message.role === 'tool');
     if (toolMessages.length === 0) {
+      const serialized = assignment.match(/same upstream snapshot:\n(\[[^\n]*\])/);
+      assert.ok(serialized, 'Pi must receive a distinct direct-predecessor result snapshot.');
+      const upstream = JSON.parse(serialized[1]) as { nodeId: string; output: string }[];
+      if (marker === 'ENTRY') assert.deepEqual(upstream, []);
+      if (marker === 'LEFT' || marker === 'RIGHT') {
+        assert.deepEqual(upstream.map(result => result.nodeId), ['entry']);
+        assert.equal(upstream[0].output, 'FINAL_ENTRY_OUTPUT');
+      }
       if (marker === 'JOIN') {
+        assert.deepEqual(upstream.map(result => result.nodeId).sort(), ['left', 'right']);
+        assert.ok(upstream.every(result => result.output === `FINAL_${result.nodeId.toUpperCase()}_OUTPUT`));
         assert.match(assignment, /Verified branch LEFT/); assert.match(assignment, /Verified branch RIGHT/);
         assert.match(assignment, /LEFT_DONE/); assert.match(assignment, /RIGHT_DONE/);
       }
@@ -118,6 +128,7 @@ text({marker:load('visit-marker'),sum,evidence});`);
       assert.equal(toolMessages[1].tool_call_id, `remember_${marker}`);
       assert.match(JSON.stringify(toolMessages[1]), new RegExp(`REMEMBERED_${marker}`));
       event(response, { content: JSON.stringify({
+        output: `FINAL_${marker}_OUTPUT`,
         findings: marker === 'LEFT' || marker === 'RIGHT' ? [{ title: `Verified branch ${marker}`, description: `app.ts line 1 accesses items[0] without an empty-list guard, observed by ${marker}.`, severity: 'low', file: 'app.ts', line: 1 }] : [],
         messages: marker === 'LEFT' || marker === 'RIGHT' ? [{ to: 'join', text: `${marker}_DONE` }] : [], assignments: [],
       }) });
@@ -125,6 +136,7 @@ text({marker:load('visit-marker'),sum,evidence});`);
     }
   } catch (error) {
     requestFailure ??= error;
+    console.error('Parallel model fixture rejected a request:', error);
     if (!response.headersSent) response.writeHead(500, { 'Content-Type': 'application/json' });
     response.end();
   }
@@ -175,6 +187,8 @@ try {
   if (requestFailure) throw requestFailure;
   assert.equal(store.get().runs[0].status, 'completed', store.get().runs[0].error);
   assert.equal(store.get().runs[0].steps, 4); assert.equal(store.get().findings.length, 2);
+  assert.equal(store.get().runs[0].results?.length, 4);
+  assert.equal(store.get().runs[0].results?.find(result => result.nodeId === 'join')?.output, 'FINAL_JOIN_OUTPUT');
   assert.equal(decisionCount, 4); assert.equal(store.get().runs[0].decisionCount, 4);
   assert.ok(store.get().runs[0].decisions?.every(decision => decision.status === 'completed' && decision.modelId === 'decision-fixture-1' && decision.recommendation === 'assigned'));
   assert.equal(requestCount, 12); assert.deepEqual(await readdir(runtime), []);
@@ -190,7 +204,8 @@ try {
   if (requestFailure) throw requestFailure;
   assert.ok(Date.now() - stoppedAt < 5000);
   assert.equal(store.get().runs[0].status, 'stopped'); assert.equal(store.get().runs[0].steps, 1);
-  assert.equal(store.get().runs[0].activeNodeIds, undefined); assert.equal(store.get().runs[0].activeNodeId, undefined);
+  assert.deepEqual(store.get().runs[0].activeNodeIds ?? [], []); assert.equal(store.get().runs[0].activeNodeId, undefined);
+  assert.equal(store.get().runs[0].results?.length, 1, 'Cancelled branches cannot publish native outputs.');
   assert.equal(store.get().findings.length, 2, 'Cancelled branches cannot publish findings.');
   assert.equal(requestCount, 17); assert.deepEqual(await readdir(runtime), []);
   assert.equal(decisionCount, 7); assert.equal(store.get().runs[0].decisionCount, 3);

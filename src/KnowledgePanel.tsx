@@ -1,10 +1,11 @@
+import { apiFetch } from './api';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { BookOpen, Check, CircleAlert, Cloud, Cpu, Download, FileText, Film, FolderOpen, Image, LoaderCircle, Mic, Search, Settings2, Trash2, Upload, X } from 'lucide-react';
 import { defaultChunkOptions, defaultEmbeddingConfig, type ChunkLocator, type ChunkOptions, type EmbeddingConfig, type KnowledgeJob, type KnowledgeModality, type KnowledgePreview, type KnowledgeSearchResult, type KnowledgeStatus } from '../shared/knowledge';
 import './knowledge.css';
 
 async function api<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`/api/knowledge${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal });
+  const response = await apiFetch(`/knowledge${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal });
   if (response.status === 204) return undefined as T;
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
@@ -128,7 +129,7 @@ export function KnowledgePanel() {
       else {
         if (!file) throw new Error('Choose a file to prepare.');
         if (status && file.size > status.limits.uploadBytes) throw new Error(`Choose a file smaller than ${formatBytes(status.limits.uploadBytes)}.`);
-        const response = await fetch('/api/knowledge/preview', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(file.name), 'X-File-Type': file.type || '', 'X-Chunk-Options': JSON.stringify(options) }, body: file, signal: controller.signal });
+        const response = await apiFetch('/knowledge/preview', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(file.name), 'X-File-Type': file.type || '', 'X-Chunk-Options': JSON.stringify(options) }, body: file, signal: controller.signal });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `File preparation failed (${response.status})`);
         next = data;

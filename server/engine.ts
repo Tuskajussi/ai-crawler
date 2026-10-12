@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode, RoutingAnswer, RoutingDecision, RoutingChoice } from '../shared/types';
+import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode, RoutingAnswer, RoutingDecision, RoutingChoice, NodeResult, ReportFinding } from '../shared/types';
 import { StateStore } from './store';
-import { InputError, traversalOrder, validateModels, validateWorkflow } from './validation';
+import { InputError, validateModels, validateWorkflow } from './validation';
 import { isEscalatableError } from './execution-errors';
 import { setMaxListeners } from 'node:events';
 import { EndpointLimiter, planWorkflow, type VisitComponent } from './scheduler';
 import { ROUTING_QUESTION_VERSION, routingModel, validateRoutingAnswer } from './routing';
 
 export interface AgentReport {
-  findings?: { title: string; description: string; severity: Finding['severity']; file?: string; line?: number; screenshot?: string; demo?: boolean }[];
+  output?: string;
+  judgment?: NodeResult['judgment'];
+  findings?: ReportFinding[];
   messages?: { to: string; text: string }[];
   assignments?: { to: string; text: string }[];
   escalation?: { reason: string };
@@ -22,8 +24,9 @@ export interface ExecutionContext {
   cycle: number;
   messages: Message[];
   findings: Finding[];
+  upstreamResults: NodeResult[];
   signal: AbortSignal;
-  escalation?: { reason: string; originalModelId: string };
+  escalation?: { reason: string; originalModelId: string; primaryOutput?: string };
   onScreenshot?: (url: string) => void;
 }
 export type AgentExecutor = (context: ExecutionContext) => Promise<AgentReport>;
@@ -47,15 +50,21 @@ export function delay(milliseconds: number, signal: AbortSignal): Promise<void> 
 }
 
 function demoReport(context: ExecutionContext): AgentReport {
-  const { node, cycle, workflow } = context;
-  const next = workflow.edges.find(edge => edge.source === node.id)?.target;
+  const { node, cycle, workflow, upstreamResults } = context;
+  const next = workflow.edges.find(edge => edge.source === node.id && edge.data?.loop !== true)?.target;
   const examples: Partial<Record<WorkflowNode['data']['role'], AgentReport['findings']>> = {
     crawler: [{ title: 'Demo: unhandled empty result', description: 'Example finding for the demo board. A crawler could flag a list view that assumes a result is always present. No repository files were inspected.', severity: 'medium', demo: true }],
     tester: [{ title: 'Demo: missing boundary test', description: 'Example finding for the demo board. A test agent could request coverage for an empty response and retry behavior. No tests were run.', severity: 'low', demo: true }],
     designer: [{ title: 'Demo: low-contrast secondary text', description: 'Example visual observation for the demo board. A real UI inspection would attach a screenshot as evidence. No screenshot was taken in this demo.', severity: 'medium', demo: true }],
   };
   return {
+    output: `Demo · cycle ${cycle}: ${node.data.label} (${node.data.modelId}) produced a simulated review of: ${node.data.prompt}`,
     findings: cycle === 1 ? examples[node.data.role] ?? [] : [],
+    ...(node.data.role === 'judge' && upstreamResults.length ? { judgment: {
+      winnerNodeId: upstreamResults[0].nodeId,
+      reasoning: 'Demo comparison only. The first candidate is selected to illustrate a recorded decision; no model quality was evaluated.',
+      scores: upstreamResults.map((result, index) => ({ nodeId: result.nodeId, score: Math.max(0, 90 - index * 5), reasoning: 'Simulated score for the demo comparison.' })),
+    } } : {}),
     messages: [{ to: 'all', text: `Demo · cycle ${cycle}: ${node.data.label} reviewed its simulated ${node.data.responsibilities[0]?.toLowerCase() || 'assignment'} task. Persona, prompt, and model selection are configured for a real Pi run.` }],
     assignments: next ? [{ to: next, text: `Demo handoff: continue from ${node.data.label}'s simulated review. Check the shared findings and verify evidence before reporting a real issue.` }] : [],
   };
@@ -98,7 +107,7 @@ export class WorkflowEngine {
     const executionMode = mode ?? state.workflow.settings.executionMode;
     if (!['demo', 'pi'].includes(executionMode)) throw new InputError('Execution mode must be demo or pi.');
     const controller = new AbortController();
-    const run: Run = { id: randomUUID(), status: 'running', mode: executionMode, startedAt: new Date().toISOString(), cycle: 0, steps: 0, escalations: 0 };
+    const run: Run = { id: randomUUID(), status: 'running', mode: executionMode, startedAt: new Date().toISOString(), cycle: 0, steps: 0, escalations: 0, activeNodeIds: [], results: [] };
     const active = { id: run.id, controller, stopping: false, task: undefined as Promise<void> | undefined };
     this.active = active;
     try {
@@ -144,7 +153,7 @@ export class WorkflowEngine {
         run.status = 'stopped';
         run.finishedAt = new Date().toISOString();
         delete run.activeNodeId;
-        delete run.activeNodeIds;
+        run.activeNodeIds = [];
       }
       for (const decision of run?.decisions ?? []) if (decision.status === 'pending') {
         decision.status = 'cancelled'; decision.reason = 'The run stopped before the routing outcome could be saved.';
@@ -166,12 +175,10 @@ export class WorkflowEngine {
   }
 
   private async execute(workflow: Workflow, models: ModelConfig[], run: Run, signal: AbortSignal): Promise<void> {
-    const order = traversalOrder(workflow);
-    const workers = workflow.settings.maxParallelAgents ?? 1;
+    const workers = workflow.settings.maxParallelAgents ?? workflow.settings.maxParallel ?? 1;
     const routing = workflow.settings.routing;
     const limiter = new EndpointLimiter([...models, ...(routing && routing.mode !== 'off' ? [routingModel(routing)] : [])], workers);
-    // Preserve the original breadth-first order unless parallel work is opted in.
-    const plan = workers === 1 ? order.map((id, index) => ({ id, nodeIds: [id], dependencies: index ? [order[index - 1]] : [] })) : planWorkflow(workflow);
+    const plan = planWorkflow(workflow);
     const continuous = workflow.settings.mode === 'loop' && workflow.settings.continuous === true;
     const cycles = workflow.settings.mode === 'once' ? 1 : workflow.settings.maxCycles;
     let failedNodeId: string | undefined;
@@ -183,7 +190,7 @@ export class WorkflowEngine {
           const current = state.runs.find(item => item.id === run.id)!;
           current.cycle = cycle;
           delete current.activeNodeId;
-          delete current.activeNodeIds;
+          current.activeNodeIds = [];
           state.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
           this.message(state, run.id, 'system', 'all', continuous
             ? `Cycle ${cycle} started. Continuous crawling stays active until you stop the run. Each reachable agent runs once in this cycle.`
@@ -194,7 +201,7 @@ export class WorkflowEngine {
           await this.store.update(state => {
             aborted(signal);
             delete state.runs.find(item => item.id === run.id)!.activeNodeId;
-            delete state.runs.find(item => item.id === run.id)!.activeNodeIds;
+            state.runs.find(item => item.id === run.id)!.activeNodeIds = [];
             this.message(state, run.id, 'system', 'all', `Cycle ${cycle} finished. Next cycle starts in ${workflow.settings.intervalSeconds}s.`);
           });
           await delay(workflow.settings.intervalSeconds * 1000, signal);
@@ -207,7 +214,7 @@ export class WorkflowEngine {
         current.status = 'completed';
         current.finishedAt = new Date().toISOString();
         delete current.activeNodeId;
-        delete current.activeNodeIds;
+        current.activeNodeIds = [];
         this.message(state, run.id, 'system', 'all', `Run completed after ${cycles} cycle${cycles === 1 ? '' : 's'} and ${current.steps} agent steps.`);
       });
     } catch (error) {
@@ -226,7 +233,7 @@ export class WorkflowEngine {
             const node = state.workflow.nodes.find(item => item.id === failedNodeId);
             if (node) node.data.status = 'error';
             delete current.activeNodeId;
-            delete current.activeNodeIds;
+            current.activeNodeIds = [];
             this.message(state, run.id, 'system', 'all', `Run failed: ${message}`);
           });
         } catch (storageError) {
@@ -246,6 +253,7 @@ export class WorkflowEngine {
     // A validated workflow can have 100 queued nodes plus active SDK listeners.
     setMaxListeners(256, signal);
     const completed = new Set<string>();
+    const results = new Map<string, NodeResult>();
     const launched = new Set<string>();
     const running = new Map<string, Promise<void>>();
     const allowance = { used: 0, decisions: 0 };
@@ -260,14 +268,21 @@ export class WorkflowEngine {
       while (completed.size < plan.length) {
         aborted(runSignal);
         if (failure) break;
+        // Freeze each ready sibling before any visit acquires an endpoint permit.
+        // Queued candidates must never observe another candidate's private answer.
+        const snapshot = this.store.get();
         for (const component of plan) {
           if (launched.has(component.id) || !component.dependencies.every(id => completed.has(id))) continue;
           launched.add(component.id);
           const task = (async () => {
-            for (const id of component.nodeIds) {
+            for (const [index, id] of component.nodeIds.entries()) {
               aborted(signal);
               try {
-                await this.executeNode(workflow, models, run, cycle, workflow.nodes.find(node => node.id === id)!, limiter, allowance, signal, error => fail(id, error));
+                const inputs = workflow.edges.filter(edge => edge.target === id && edge.data?.loop !== true && id !== workflow.settings.entryNodeId)
+                  .map(edge => results.get(edge.source)).filter((result): result is NodeResult => Boolean(result));
+                const upstream = [...new Map(inputs.map(result => [result.nodeId, result])).values()];
+                const result = await this.executeNode(workflow, models, run, cycle, workflow.nodes.find(node => node.id === id)!, limiter, allowance, signal, error => fail(id, error), index ? this.store.get() : snapshot, upstream);
+                results.set(id, result);
               } catch (error) { fail(id, error); throw error; }
             }
             completed.add(component.id);
@@ -291,13 +306,13 @@ export class WorkflowEngine {
     const ids = run.activeNodeIds ?? (run.activeNodeId ? [run.activeNodeId] : []);
     run.activeNodeIds = active ? [...new Set([...ids, nodeId])] : ids.filter(id => id !== nodeId);
     if (run.activeNodeIds.length) run.activeNodeId = run.activeNodeIds[0];
-    else { delete run.activeNodeId; delete run.activeNodeIds; }
+    else { delete run.activeNodeId; run.activeNodeIds = []; }
     const node = state.workflow.nodes.find(item => item.id === nodeId)!;
     if (active) node.data.status = 'running';
     else if (node.data.status === 'running') node.data.status = 'idle';
   }
 
-  private async routeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { decisions: number }, signal: AbortSignal, fail: (error: unknown) => void): Promise<{ choice: 'assigned' | 'supervisor'; reason?: string }> {
+  private async routeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { decisions: number }, signal: AbortSignal, fail: (error: unknown) => void, snapshot: AppState, upstreamResults: NodeResult[]): Promise<{ choice: 'assigned' | 'supervisor'; reason?: string }> {
     const settings = workflow.settings.routing;
     const assigned = models.find(model => model.id === node.data.modelId)!;
     if (run.mode !== 'pi' || !settings || settings.mode === 'off' || assigned.kind !== 'local' || node.data.modelId === workflow.settings.supervisorModelId) return { choice: 'assigned' };
@@ -336,8 +351,8 @@ export class WorkflowEngine {
         const started = Date.now();
         try {
           if (!this.options.routingExecutor) throw new Error('Decision routing is unavailable. Configure a supported decision endpoint.');
-          const state = this.store.get();
-          answer = await this.options.routingExecutor({ workflow, models, node, run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, signal });
+          const state = structuredClone(snapshot);
+          answer = await this.options.routingExecutor({ workflow: structuredClone(workflow), models: structuredClone(models), node: structuredClone(node), run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, upstreamResults: structuredClone(upstreamResults), signal });
           validateRoutingAnswer(answer);
           aborted(signal);
         } catch (error) { routingError = error; }
@@ -377,15 +392,23 @@ export class WorkflowEngine {
     return { choice: settings.mode === 'active' && (recommendation as RoutingChoice) === 'supervisor' ? 'supervisor' : 'assigned', reason };
   }
 
-  private async executeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { used: number; decisions: number }, signal: AbortSignal, fail: (error: unknown) => void): Promise<void> {
+  private async executeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { used: number; decisions: number }, signal: AbortSignal, fail: (error: unknown) => void, snapshot: AppState, upstreamResults: NodeResult[]): Promise<NodeResult> {
     const captures = new Set<string>();
     const visit = async (visitNode: WorkflowNode, escalation?: ExecutionContext['escalation']): Promise<AgentReport> => {
       const model = models.find(item => item.id === visitNode.data.modelId && item.enabled)!;
       return limiter.run(model, signal, async () => {
         try {
           await this.store.update(state => { aborted(signal); this.setNodeActive(state, run.id, node.id, true); });
-          const state = this.store.get();
-          const context: ExecutionContext = { workflow, models, node: visitNode, run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, signal, escalation,
+          const state = structuredClone(snapshot);
+          if (escalation) {
+            // Carry this candidate's verified primary work into stronger review
+            // while retaining its independent snapshot of the other branches.
+            const latest = this.store.get();
+            state.findings = [...latest.findings.filter(finding => finding.nodeId === node.id), ...state.findings.filter(finding => finding.nodeId !== node.id)];
+            const seen = new Set(state.messages.map(message => message.id));
+            state.messages.push(...latest.messages.filter(message => message.runId === run.id && message.from === node.id && !seen.has(message.id)));
+          }
+          const context: ExecutionContext = { workflow: structuredClone(workflow), models: structuredClone(models), node: structuredClone(visitNode), run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, upstreamResults: structuredClone(upstreamResults), signal, escalation,
             onScreenshot: url => { captures.add(url); this.screenshots.add(url); },
           };
           if (run.mode === 'demo') { await delay(this.options.demoStepMs ?? 1100, signal); return demoReport(context); }
@@ -407,10 +430,11 @@ export class WorkflowEngine {
       });
     };
     try {
-      const routing = await this.routeNode(workflow, models, run, cycle, node, limiter, allowance, signal, fail);
+      const routing = await this.routeNode(workflow, models, run, cycle, node, limiter, allowance, signal, fail, snapshot, upstreamResults);
       let report: AgentReport;
       let escalationReason: string | undefined;
       let originalError: unknown;
+      let executedModelId = node.data.modelId;
       try {
         if (routing.choice === 'supervisor') { report = { findings: [], messages: [], assignments: [] }; escalationReason = `Decision routing: ${routing.reason}`; }
         else { report = await visit(node); escalationReason = report.escalation?.reason; }
@@ -454,16 +478,32 @@ export class WorkflowEngine {
             this.message(state, run.id, 'system', 'all', `Escalating ${node.data.label} to ${supervisor!.name}: ${escalationReason}. Used ${allowance.used} of ${maximum} supervisor visits this cycle and ${current.escalations} of ${maximumPerRun} this run.`);
           });
           if (allowanceError) throw new Error(allowanceError);
-          report = await visit({ ...node, data: { ...node.data, modelId: supervisorId } }, { reason: escalationReason, originalModelId: node.data.modelId });
+          executedModelId = supervisorId;
+          report = await visit({ ...node, data: { ...node.data, modelId: supervisorId } }, { reason: escalationReason, originalModelId: node.data.modelId, ...(report.output ? { primaryOutput: report.output } : {}) });
           if (report.escalation) throw new Error(`Supervisor ${supervisor!.name} requested further escalation: ${report.escalation.reason}. Further model calls are blocked; human review is required.`);
         }
       }
+      const fallbackOutput = (report.findings?.length
+        ? report.findings.map(finding => `${finding.title}: ${finding.description}`).join('\n\n')
+        : report.messages?.map(message => message.text).join('\n\n') || 'Review completed with no verified findings.').slice(0, 30_000);
+      const result: NodeResult = {
+        nodeId: node.id, nodeName: node.data.label, modelId: executedModelId, cycle,
+        output: report.output ?? fallbackOutput, findings: structuredClone(report.findings ?? []),
+        ...(report.judgment ? { judgment: structuredClone(report.judgment) } : {}), completedAt: new Date().toISOString(),
+      };
       await this.store.update(state => {
         aborted(signal);
-        state.runs.find(item => item.id === run.id)!.steps++;
+        const current = state.runs.find(item => item.id === run.id)!;
+        current.steps++;
+        (current.results ??= []).push(result);
+        if (current.results.length > 200) {
+          current.results = current.results.slice(-200);
+          if (current.steps === 201) this.message(state, run.id, 'system', 'all', 'Older agent outputs are omitted from run history. The latest 200 outputs are retained; current-cycle handoffs remain complete.');
+        }
         state.workflow.nodes.find(item => item.id === node.id)!.data.status = 'done';
         this.applyReport(state, workflow, run, node, report);
       });
+      return result;
     } finally { for (const url of captures) this.screenshots.delete(url); }
   }
 
@@ -493,7 +533,7 @@ export class WorkflowEngine {
       this.message(state, run.id, node.id, assignment.to, assignment.text, 'assignment');
     }
     const assigned = new Set((report.assignments ?? []).map(item => item.to));
-    for (const edge of handoff ? workflow.edges.filter(item => item.source === node.id) : []) {
+    for (const edge of handoff ? workflow.edges.filter(item => item.source === node.id && item.data?.loop !== true) : []) {
       if (!assigned.has(edge.target)) this.message(state, run.id, node.id, edge.target, `${node.data.label} completed its step. Continue with your responsibilities and the shared findings.`, 'assignment');
     }
     state.findings = state.findings.slice(0, 2000);

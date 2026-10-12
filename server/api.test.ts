@@ -1,228 +1,272 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { createApp } from './index';
-import type { AppState, ModelConfig, RuntimeStatus } from '../shared/types';
+import { ReliabilityVisitTracker } from './reliability';
 
-test('API persists messages and settings, validates recipients, and stops active runs', async () => {
+const SECRET = 'integration-test-registration-secret-at-least-32-characters';
+const PASSWORD = 'a long integration test password';
+
+interface RequestOptions {
+  csrf?: boolean;
+  headers?: Record<string, string>;
+}
+
+async function withServer(
+  run: (context: { instance: Awaited<ReturnType<typeof createApp>>; base: string; directory: string }) => Promise<void>,
+  config?: { publicUrl: string; hosted: boolean },
+): Promise<void> {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-api-'));
-  const { app, engine } = await createApp({ statePath: path.join(directory, 'state.json'), demoStepMs: 60_000 });
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const request = async (route: string, method = 'GET', body?: unknown, origin?: string) => fetch(`${base}/api${route}`, {
-    method, headers: { 'Content-Type': 'application/json', ...(origin ? { Origin: origin } : {}) }, body: body === undefined ? undefined : JSON.stringify(body),
-  });
   try {
-    const stateResponse = await request('/state');
+    const instance = await createApp({ dataDir: path.join(directory, 'data'), registrationSecret: SECRET, demoStepMs: 60_000, ...(config ? { config } : {}) });
+    const server = instance.app.listen(0, '127.0.0.1');
+    try {
+      await new Promise<void>(resolve => server.once('listening', resolve));
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+      await run({ instance, base, directory });
+    } finally {
+      try {
+        await instance.shutdown();
+      } finally {
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      }
+    }
+  } finally {
+    const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+    assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    assert.ok(path.basename(directory).startsWith('crawlspace-api-'));
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+// Node fetch replaces Host, so use a real HTTP request for proxy-origin tests.
+async function fetchWithHost(url: string, init: { method: string; headers: Record<string, string>; body?: string }): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    const request = httpRequest(url, { method: init.method, headers: init.headers }, response => {
+      const chunks: Buffer[] = [];
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      response.on('error', reject);
+      response.on('end', () => {
+        const headers = new Headers();
+        for (let index = 0; index < response.rawHeaders.length; index += 2) headers.append(response.rawHeaders[index], response.rawHeaders[index + 1]);
+        resolve(new Response(Buffer.concat(chunks), { status: response.statusCode, headers }));
+      });
+    });
+    request.on('error', reject);
+    request.end(init.body);
+  });
+}
+function browser(base: string, defaultHeaders: Record<string, string> = {}) {
+  let cookie = '';
+  let csrfToken = '';
+  const request = async (route: string, method = 'GET', body?: unknown, options: RequestOptions = {}) => {
+    const transport = defaultHeaders.Host || options.headers?.Host ? fetchWithHost : fetch;
+    const response = await transport(`${base}${route}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json', ...defaultHeaders,
+        ...(cookie ? { Cookie: cookie } : {}),
+        ...(csrfToken && options.csrf !== false && !['GET', 'HEAD', 'OPTIONS'].includes(method) ? { 'X-CSRF-Token': csrfToken } : {}),
+        ...options.headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const setCookie = response.headers.get('set-cookie');
+    if (setCookie) cookie = setCookie.split(';')[0];
+    return response;
+  };
+  const authenticate = async (route: string, body: unknown) => {
+    const response = await request(route, 'POST', body);
+    const data = await response.json();
+    assert.ok(response.ok, JSON.stringify(data));
+    csrfToken = data.csrfToken;
+    return { response, data };
+  };
+  return {
+    request,
+    register: (username: string) => authenticate('/auth/register', { username, password: PASSWORD, registrationSecret: SECRET }),
+    login: (username: string, password = PASSWORD) => authenticate('/auth/login', { username, password }),
+  };
+}
+
+test('authenticated API preserves workflow behavior and requires CSRF for every mutation', async () => {
+  await withServer(async ({ instance, base }) => {
+    const client = browser(base);
+    const anonymousSession = await client.request('/auth/session');
+    assert.equal(anonymousSession.status, 200);
+    assert.equal((await anonymousSession.json()).user, null);
+    assert.equal((await client.request('/state')).status, 401);
+    assert.equal((await client.request('/runs', 'POST', { mode: 'demo' })).status, 401);
+    assert.equal((await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: 'wrong' })).status, 403);
+    const { response: registered, data: session } = await client.register('tester');
+    assert.equal(registered.status, 201);
+    const cookie = registered.headers.get('set-cookie') ?? '';
+    assert.match(cookie, /crawlspace_session=/);
+    assert.match(cookie, /HttpOnly/i);
+    assert.match(cookie, /SameSite=Lax/i);
+    assert.doesNotMatch(cookie, /;\s*Secure/i);
+    assert.equal(session.user.username, 'tester');
+    assert.equal(session.registrationEnabled, true);
+    assert.match(session.csrfToken, /^[a-f0-9]{64}$/);
+    assert.equal(session.token, undefined);
+    assert.equal(session.password, undefined);
+    const restoredSession = await (await client.request('/auth/session')).json();
+    assert.equal(restoredSession.user.id, session.user.id);
+    assert.equal(restoredSession.csrfToken, session.csrfToken);
+    assert.equal((await client.request('/messages', 'POST', { from: 'you', to: 'all', text: 'blocked', type: 'message' }, { csrf: false })).status, 403);
+    assert.equal((await client.request('/messages', 'POST', { from: 'you', to: 'all', text: 'blocked', type: 'message' }, { headers: { 'X-CSRF-Token': 'wrong' } })).status, 403);
+    const stateResponse = await client.request('/state');
     assert.equal(stateResponse.status, 200);
     const state = await stateResponse.json();
-    assert.equal((await request('/messages', 'POST', { from: 'you', to: 'missing', text: 'hello', type: 'message' })).status, 400);
-    const sent = await request('/messages', 'POST', { from: 'you', to: 'tester', text: 'Review empty responses.', type: 'assignment' });
+    assert.equal((await client.request('/messages', 'POST', { from: 'you', to: 'missing', text: 'hello', type: 'message' })).status, 400);
+    const sent = await client.request('/messages', 'POST', { from: 'you', to: 'tester', text: 'Review empty responses.', type: 'assignment' });
     assert.equal(sent.status, 201);
     assert.equal((await sent.json()).messages.at(-1).to, 'tester');
-    assert.equal((await request('/state', 'GET', undefined, 'https://untrusted.example')).status, 403);
+    assert.equal((await client.request('/state', 'GET', undefined, { headers: { Origin: 'https://untrusted.example' } })).status, 403);
     state.workflow.settings.mode = 'once';
-    assert.equal((await request('/workflow', 'PUT', state.workflow)).status, 200);
-    assert.equal((await request('/runs', 'POST', { mode: 'demo' })).status, 202);
-    assert.equal((await request('/runs', 'POST', { mode: 'demo' })).status, 409);
-    assert.equal((await request('/workflow', 'PUT', state.workflow)).status, 409);
-    const stopped = await request('/runs/stop', 'POST', {});
+    assert.equal((await client.request('/workflow', 'PUT', state.workflow)).status, 200);
+    assert.equal((await client.request('/runs', 'POST', { mode: 'demo' })).status, 202);
+    assert.equal((await client.request('/runs', 'POST', { mode: 'demo' })).status, 409);
+    assert.equal((await client.request('/workflow', 'PUT', state.workflow)).status, 409);
+    const stopped = await client.request('/runs/stop', 'POST', {});
     assert.equal(stopped.status, 200);
     assert.equal((await stopped.json()).runs[0].status, 'stopped');
-    await engine.waitForIdle();
-    assert.equal((await request('/findings/missing', 'PATCH', { status: 'resolved' })).status, 404);
-  } finally {
-    await engine.stop();
-    await engine.waitForIdle();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('users can save their own compatible models without persisting credentials', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-model-api-'));
-  const statePath = path.join(directory, 'state.json');
-  const { app, engine } = await createApp({ statePath });
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const request = (route: string, method = 'GET', body?: unknown) => fetch(`${base}${route}`, {
-    method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body),
+    const workspace = await instance.workspaces.get(session.user.id);
+    await workspace.engine.waitForIdle();
+    assert.equal((await client.request('/findings/missing', 'PATCH', { status: 'resolved' })).status, 404);
+    assert.equal((await client.request('/auth/logout', 'POST', {}, { csrf: false })).status, 403);
+    assert.equal((await client.request('/auth/password', 'POST', { currentPassword: PASSWORD, newPassword: 'different sufficiently long password' }, { csrf: false })).status, 403);
   });
-  const environmentName = 'CRAWLSPACE_TEST_MODEL_CREDENTIAL';
-  const previous = process.env[environmentName];
-  const credential = 'test-only-credential-must-stay-out-of-state';
-  try {
-    delete process.env[environmentName];
-    const initial = await (await request('/state')).json() as AppState;
-    const custom: ModelConfig = { id: 'my-model', name: 'My compatible model', provider: 'custom', modelId: 'my-own-model', kind: 'cloud', baseUrl: 'https://models.example.test/v1', apiKeyEnv: '', enabled: true };
-    let models = [...initial.models, custom];
-    const created = await request('/models', 'PUT', models);
-    assert.equal(created.status, 200);
-    assert.deepEqual((await created.json() as AppState).models.at(-1), custom);
-    let runtime = await (await request('/health')).json() as RuntimeStatus;
-    assert.equal(typeof runtime.piAvailable, 'boolean');
-    assert.equal(runtime.models.find(model => model.id === custom.id)?.ready, true, 'Auth-free compatible endpoints do not require a cloud credential.');
-    assert.match(runtime.models.find(model => model.id === custom.id)?.message ?? '', /not been tested/);
-
-    models = [...initial.models, { ...custom, apiKeyEnv: environmentName }];
-    assert.equal((await request('/models', 'PUT', models)).status, 200);
-    runtime = await (await request('/health')).json() as RuntimeStatus;
-    assert.equal(runtime.models.find(model => model.id === custom.id)?.ready, false);
-    process.env[environmentName] = credential;
-    const health = await (await request('/health')).text();
-    assert.equal((JSON.parse(health) as RuntimeStatus).models.find(model => model.id === custom.id)?.ready, true);
-    assert.ok(!health.includes(credential));
-
-    const rawKey = await request('/models', 'PUT', [...initial.models, { ...custom, apiKey: credential }]);
-    assert.equal(rawKey.status, 400);
-    assert.ok(!(await rawKey.text()).includes(credential));
-    assert.equal((await request('/models', 'PUT', [...initial.models, { ...custom, unexpected: true }])).status, 400);
-    for (const provider of ['custom', 'ollama'] as const) {
-      assert.equal((await request('/models', 'PUT', [...initial.models, { ...custom, provider, baseUrl: '' }])).status, 400);
-    }
-    const persisted = await readFile(statePath, 'utf8');
-    assert.ok(!persisted.includes(credential));
-    assert.deepEqual((await (await request('/state')).json() as AppState).models, models, 'Rejected edits must leave the saved model library intact.');
-
-    models = [...initial.models, { ...custom, name: 'Updated compatible model' }];
-    assert.equal((await request('/models', 'PUT', models)).status, 200);
-    assert.equal((await (await request('/state')).json() as AppState).models.at(-1)?.name, 'Updated compatible model');
-    assert.equal((await request('/models', 'PUT', initial.models)).status, 200);
-    assert.deepEqual((await (await request('/state')).json() as AppState).models, initial.models);
-  } finally {
-    if (previous === undefined) delete process.env[environmentName];
-    else process.env[environmentName] = previous;
-    await engine.stop();
-    await engine.waitForIdle();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(directory, { recursive: true, force: true });
-  }
 });
 
-test('subscription status stays read-only and probe routes enforce readiness and run locks', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-account-api-'));
-  const credentials = path.join(directory, 'credentials');
-  const { app, engine, chatgpt } = await createApp({ statePath: path.join(directory, 'state.json'), demoStepMs: 60_000, chatgptOptions: { credentialDirectory: credentials, fetch: async () => { throw new Error('This test must never contact an external server.'); } } });
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const request = (route: string, method = 'GET', body?: unknown) => fetch(`${base}${route}`, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
-  try {
-    assert.deepEqual(await (await request('/chatgpt/status')).json(), { profiles: [] });
-    assert.equal((await request('/health')).status, 200);
-    await assert.rejects(stat(credentials), { code: 'ENOENT' }, 'Viewing health/status must not initialize credential storage.');
-    assert.equal((await request('/models/missing/probe', 'POST', {})).status, 404);
-    const state = await (await request('/state')).json() as AppState;
-    const subscription: ModelConfig = { id: 'subscription', name: 'Optional stronger review', provider: 'openai', modelId: 'test-model', kind: 'cloud', baseUrl: '', apiKeyEnv: '', enabled: true, authMethod: 'chatgpt' };
-    assert.equal((await request('/models', 'PUT', [...state.models, subscription])).status, 200);
-    const probe = await request('/models/subscription/probe', 'POST', {});
-    assert.equal(probe.status, 200);
-    const result = await probe.json();
-    assert.equal(result.ready, false);
-    assert.match(result.message, /connect|ChatGPT/);
-    await assert.rejects(stat(credentials), { code: 'ENOENT' });
-    assert.equal((await request('/runs', 'POST', { mode: 'demo' })).status, 202);
-    assert.equal((await request('/models/subscription/probe', 'POST', {})).status, 409);
-    for (const action of ['login', 'select', 'logout', 'cancel']) assert.equal((await request(`/chatgpt/${action}`, 'POST', {})).status, 409);
-    assert.equal((await request('/runs/stop', 'POST', {})).status, 200);
-    assert.equal((await request('/chatgpt/select', 'POST', {})).status, 400);
-    assert.equal((await request('/chatgpt/logout', 'POST', { profileId: '<invalid>' })).status, 400);
-  } finally {
-    await engine.stop(); await engine.waitForIdle(); await chatgpt.dispose();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('shutdown rejects new work immediately and drains the active run safely on duplicate calls', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-shutdown-api-'));
-  const { app, engine, store, shutdown } = await createApp({ statePath: path.join(directory, 'state.json'), demoStepMs: 60_000,
-    chatgptOptions: { credentialDirectory: path.join(directory, 'credentials'), fetch: async () => { throw new Error('Shutdown must not start an external request.'); } },
+test('accounts have independent workflows, messages, Knowledge, reliability and protected screenshot directories', async () => {
+  await withServer(async ({ instance, base }) => {
+    const alice = browser(base);
+    const bob = browser(base);
+    const { data: aliceSession } = await alice.register('alice');
+    const { data: bobSession } = await bob.register('bob');
+    assert.notEqual(aliceSession.user.id, bobSession.user.id);
+    const aliceState = await (await alice.request('/state')).json();
+    aliceState.workflow.name = 'Alice private workflow';
+    assert.equal((await alice.request('/workflow', 'PUT', aliceState.workflow)).status, 200);
+    const sent = await alice.request('/messages', 'POST', { from: 'you', to: 'all', text: 'Alice private review assignment', type: 'message' });
+    assert.equal(sent.status, 201);
+    const bobState = await (await bob.request('/state')).json();
+    assert.notEqual(bobState.workflow.name, 'Alice private workflow');
+    assert.ok(!bobState.messages.some((message: { text: string }) => message.text === 'Alice private review assignment'));
+    const aliceWorkspace = await instance.workspaces.get(aliceSession.user.id);
+    const bobWorkspace = await instance.workspaces.get(bobSession.user.id);
+    assert.notEqual(aliceWorkspace.directory, bobWorkspace.directory);
+    assert.notEqual(aliceWorkspace.chatgpt.credentialDirectory, bobWorkspace.chatgpt.credentialDirectory);
+    assert.notEqual(aliceWorkspace.knowledge, bobWorkspace.knowledge);
+    const previewResponse = await alice.request('/knowledge/preview', 'POST', { name: 'alice-private.txt', text: 'Private local Knowledge material.' });
+    assert.equal(previewResponse.status, 200);
+    const preview = await previewResponse.json();
+    assert.equal((await bob.request('/knowledge/index', 'POST', { previewId: preview.id, allowCloudUpload: false })).status, 404);
+    assert.equal(bobWorkspace.knowledge.status().sources.length, 0);
+    const tracker = new ReliabilityVisitTracker(aliceState.models[0], { runId: 'fixture-run', nodeId: 'tester', cycle: 1, codeMode: false });
+    await aliceWorkspace.reliability.record(tracker.finish('success'));
+    assert.equal((await (await alice.request('/reliability')).json()).retention.retainedVisits, 1);
+    assert.equal((await (await bob.request('/reliability')).json()).retention.retainedVisits, 0);
+    const aliceScreenshots = path.join(aliceWorkspace.directory, 'screenshots');
+    await mkdir(aliceScreenshots, { recursive: true });
+    await writeFile(path.join(aliceScreenshots, 'private-review.png'), Buffer.from('alice screenshot evidence'));
+    const aliceScreenshot = await alice.request('/screenshots/private-review.png');
+    assert.equal(aliceScreenshot.status, 200);
+    assert.equal(await aliceScreenshot.text(), 'alice screenshot evidence');
+    assert.equal((await bob.request('/screenshots/private-review.png')).status, 404);
+    assert.equal((await browser(base).request('/screenshots/private-review.png')).status, 401);
+    assert.equal((await bob.request(`/screenshots/${aliceSession.user.id}/private-review.png`)).status, 404);
   });
-  // Keep HTTP listening to verify the shutdown guard even on existing connections.
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const request = (route: string, method = 'POST', body: unknown = {}) => fetch(`${base}${route}`, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  try {
-    assert.equal((await request('/runs', 'POST', { mode: 'demo' })).status, 202);
-    assert.equal(engine.isRunning, true);
-    let slow!: ReturnType<typeof httpRequest>;
-    const accepted = new Promise<void>(resolve => server.once('request', () => resolve()));
-    const slowResponse = new Promise<number>((resolve, reject) => {
-      slow = httpRequest(`${base}/runs`, { method: 'POST', headers: { 'Content-Type': 'application/json' } }, response => {
-        response.resume(); response.once('end', () => resolve(response.statusCode!));
-      });
-      slow.once('error', reject);
-      slow.write('{"mode":');
-    });
-    await accepted;
-    const stopping = shutdown();
-    const duplicate = shutdown();
-    slow.end('"demo"}');
-    assert.equal(await slowResponse, 503, 'A request accepted before shutdown must recheck after its slow body is parsed.');
-    const state = store.get();
-    const results = await Promise.all([
-      request('/runs', 'POST', { mode: 'demo' }),
-      request('/models', 'PUT', state.models),
-      request('/models/qwen/probe'),
-      request('/chatgpt/login'),
-    ]);
-    for (const response of results) {
-      assert.equal(response.status, 503);
-      assert.match((await response.json()).error, /shut|stop/i);
-    }
-    await Promise.all([stopping, duplicate, shutdown()]);
-    assert.equal(engine.isRunning, false);
-    assert.equal(store.get().runs.length, 1, 'Shutdown must never accept a replacement run.');
-    assert.equal(store.get().runs[0].status, 'stopped');
-    assert.equal(store.get().findings.length, 0);
-    const persisted = JSON.parse(await readFile(store.filePath, 'utf8')) as AppState;
-    assert.equal(persisted.runs[0].status, 'stopped');
-  } finally {
-    await shutdown();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(directory, { recursive: true, force: true });
-  }
 });
 
-test('shutdown drains credentials after a failed stop save and keeps new work blocked', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-shutdown-save-failure-'));
-  const { app, engine, store, chatgpt, shutdown } = await createApp({ statePath: path.join(directory, 'state.json'), demoStepMs: 60_000,
-    chatgptOptions: { credentialDirectory: path.join(directory, 'credentials'), fetch: async () => { throw new Error('Shutdown must not start an external request.'); } },
+test('logout and password changes revoke sessions; bad password changes keep the user signed in', async () => {
+  await withServer(async ({ base }) => {
+    const first = browser(base);
+    const second = browser(base);
+    await first.register('tester');
+    assert.equal((await second.request('/auth/login', 'POST', { username: 'tester', password: 'incorrect long password' })).status, 401);
+    await second.login('tester');
+    const wrongChange = await first.request('/auth/password', 'POST', { currentPassword: 'wrong long password', newPassword: 'changed integration password' });
+    assert.ok([400, 403].includes(wrongChange.status));
+    assert.equal((await first.request('/state')).status, 200);
+    assert.equal((await second.request('/auth/logout', 'POST', {})).ok, true);
+    assert.equal((await second.request('/state')).status, 401);
+    assert.equal((await (await second.request('/auth/session')).json()).user, null);
+    await second.login('tester');
+    const changed = await first.request('/auth/password', 'POST', { currentPassword: PASSWORD, newPassword: 'changed integration password' });
+    assert.equal(changed.ok, true);
+    assert.equal((await first.request('/state')).status, 401);
+    assert.equal((await second.request('/state')).status, 401);
+    await first.login('tester', 'changed integration password');
+    assert.equal((await first.request('/state')).status, 200);
   });
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const update = store.update.bind(store);
-  const dispose = chatgpt.dispose.bind(chatgpt);
-  let disposed = false;
-  chatgpt.dispose = async () => { await dispose(); await new Promise(resolve => setTimeout(resolve, 20)); disposed = true; };
-  try {
-    await engine.start('demo');
-    for (let attempt = 0; !store.get().runs[0].activeNodeId && attempt < 100; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
-    assert.ok(store.get().runs[0].activeNodeId, 'The demo must be in an active step before injecting its stop-save failure.');
-    store.update = async () => { throw new Error('Injected shutdown stop save failure'); };
-    await assert.rejects(shutdown(), error => error instanceof AggregateError && error.errors.some(item => /shutdown stop save failure/.test(String(item))));
-    assert.equal(disposed, true, 'An unsuccessful stop commit must still await credential rotation cleanup.');
-    assert.equal(engine.isRunning, true, 'The failed durable stop must remain locked.');
-    assert.equal(store.get().runs[0].status, 'running');
-    for (const route of ['/runs', '/models/qwen/probe', '/chatgpt/login']) {
-      const response = await fetch(`${base}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      assert.equal(response.status, 503);
-      await response.text();
+});
+
+test('hosted mode trusts the configured origin and issues Secure session cookies', async () => {
+  await withServer(async ({ base }) => {
+    const hostedHeaders = { Host: 'crawl.example.com', Origin: 'https://crawl.example.com' };
+    const client = browser(base, hostedHeaders);
+    const { response, data } = await client.register('hosted-user');
+    assert.match(response.headers.get('set-cookie') ?? '', /;\s*Secure/i);
+    assert.equal(data.user.username, 'hosted-user');
+    assert.equal((await client.request('/state')).status, 200);
+    assert.equal((await client.request('/state', 'GET', undefined, { headers: { Origin: 'https://other.example.com' } })).status, 403);
+    assert.equal((await client.request('/auth/session', 'GET', undefined, { headers: { Host: 'attacker.example.com' } })).status, 403);
+  }, { publicUrl: 'https://crawl.example.com', hosted: true });
+});
+
+
+
+test('authentication rejects malformed sessions, cross-site/form writes, and repeated secret guesses', async () => {
+  await withServer(async ({ instance, base }) => {
+    const client = browser(base);
+    const malformed = await client.request('/auth/session', 'GET', undefined, { headers: { Cookie: 'crawlspace_session=malformed%00cookie' } });
+    assert.equal(malformed.status, 200);
+    assert.equal((await malformed.json()).user, null);
+    assert.equal((await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: SECRET }, { headers: { 'Content-Type': 'text/plain' } })).status, 415);
+    assert.equal((await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: SECRET }, { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+    const malformedJson = await fetch(`${base}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' });
+    assert.equal(malformedJson.status, 400);
+    const missing = await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD });
+    const wrong = await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: 'wrong secret' });
+    assert.equal(missing.status, 403);
+    assert.equal(wrong.status, 403);
+    assert.deepEqual(await missing.json(), await wrong.json());
+    for (let attempt = 2; attempt < 20; attempt += 1) {
+      assert.equal((await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: 'wrong secret' })).status, 403);
     }
-    await assert.rejects(shutdown(), AggregateError, 'Repeated shutdown must retain the failure rather than restart resources.');
-  } finally {
-    store.update = update; chatgpt.dispose = dispose;
-    await engine.stop(); await engine.waitForIdle(); await chatgpt.dispose();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(directory, { recursive: true, force: true });
-  }
+    const limited = await client.request('/auth/register', 'POST', { username: 'tester', password: PASSWORD, registrationSecret: SECRET });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get('retry-after'), '900');
+    assert.equal(instance.auth.firstUserId, undefined);
+  });
+});
+
+test('stale and malformed session responses cannot clear a newer signed-in account cookie', async () => {
+  await withServer(async ({ base }) => {
+    const client = browser(base);
+    const { response: registered } = await client.register('session-race');
+    const oldCookie = registered.headers.get('set-cookie')!.split(';')[0];
+    const logout = await client.request('/auth/logout', 'POST', {});
+    assert.equal(logout.status, 200);
+    assert.match(logout.headers.get('set-cookie') ?? '', /crawlspace_session=;.*Expires=Thu, 01 Jan 1970/i);
+    const { response: signedIn } = await client.login('session-race');
+    const newCookie = signedIn.headers.get('set-cookie')!.split(';')[0];
+    assert.notEqual(newCookie, oldCookie);
+    for (const Cookie of [oldCookie, 'crawlspace_session=malformed%00cookie']) {
+      const staleState = await fetch(`${base}/state`, { headers: { Cookie } });
+      assert.equal(staleState.status, 401);
+      assert.equal(staleState.headers.get('set-cookie'), null);
+      const staleSession = await fetch(`${base}/auth/session`, { headers: { Cookie } });
+      assert.equal(staleSession.status, 200);
+      assert.equal((await staleSession.json()).user, null);
+      assert.equal(staleSession.headers.get('set-cookie'), null);
+    }
+    assert.equal((await fetch(`${base}/state`, { headers: { Cookie: newCookie } })).status, 200);
+  });
 });

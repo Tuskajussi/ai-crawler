@@ -1,9 +1,11 @@
 import path from 'node:path';
-import type { Workflow } from '../shared/types';
+import type { NodeResult, Workflow } from '../shared/types';
 import type { AgentReport } from './engine';
 import type { ProjectReader } from './project';
 
-export async function parseAgentReport(output: string, workflow: Workflow, project: ProjectReader, screenshot?: string): Promise<AgentReport> {
+export interface ReportInputs { upstreamResults: NodeResult[]; isJudge: boolean; }
+
+export async function parseAgentReport(output: string, workflow: Workflow, project: ProjectReader, screenshot?: string, inputs?: ReportInputs): Promise<AgentReport> {
   const cleaned = output.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let parsed: unknown;
   try { parsed = JSON.parse(cleaned); } catch { throw new Error('Agent returned an invalid report. Expected a JSON object with findings, messages, and assignments.'); }
@@ -44,5 +46,34 @@ export async function parseAgentReport(output: string, workflow: Workflow, proje
       || Object.keys(body.escalation).some(key => key !== 'reason')) throw new Error('Agent escalation must contain only a reason of 1–2,000 characters.');
     escalation = { reason: ((body.escalation as Record<string, unknown>).reason as string).trim() };
   }
-  return { findings, messages: parseMessages(body.messages, 'messages'), assignments: parseMessages(body.assignments, 'assignments'), ...(escalation ? { escalation } : {}) };
+  const messages = parseMessages(body.messages, 'messages');
+  const assignments = parseMessages(body.assignments, 'assignments');
+  if (body.output !== undefined && !validText(body.output, 30_000)) throw new Error('Agent output must be nonempty text of at most 30,000 characters.');
+  if (inputs?.isJudge && body.output === undefined) throw new Error('Judge report must include its complete evaluation in output.');
+  // Older reviewer reports still produce a useful handoff without dropping observed evidence.
+  const fallback = findings.length
+    ? findings.map(finding => `${finding.title}: ${finding.description}`).join('\n\n')
+    : messages.map(message => message.text).join('\n\n') || 'Review completed with no verified findings.';
+  const report: AgentReport = { output: (body.output as string | undefined) ?? fallback.slice(0, 30_000), findings, messages, assignments, ...(escalation ? { escalation } : {}) };
+  if (inputs?.isJudge || body.judgment !== undefined) {
+    if (!inputs?.isJudge) throw new Error('Only a judge agent may return a judgment.');
+    const judgment = body.judgment;
+    if (!judgment || typeof judgment !== 'object' || Array.isArray(judgment)) throw new Error('Judge report must include a judgment object.');
+    const result = judgment as Record<string, unknown>;
+    const candidateIds = new Set(inputs.upstreamResults.map(candidate => candidate.nodeId));
+    if (candidateIds.size < 2) throw new Error('A judge needs results from at least two direct predecessor agents.');
+    if (!validText(result.reasoning) || !Array.isArray(result.scores) || result.scores.length !== candidateIds.size) throw new Error('Judge must explain its decision and score every direct predecessor exactly once.');
+    const scored = new Set<string>();
+    const scores: NonNullable<NodeResult['judgment']>['scores'] = result.scores.map(item => {
+      if (!item || typeof item !== 'object' || typeof item.nodeId !== 'string' || !candidateIds.has(item.nodeId) || scored.has(item.nodeId) || typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 100 || !validText(item.reasoning)) throw new Error('Judge scores must reference each direct predecessor once, with a score from 0 to 100 and reasoning.');
+      scored.add(item.nodeId);
+      return { nodeId: item.nodeId, score: item.score, reasoning: item.reasoning };
+    });
+    const bestScore = Math.max(...scores.map(score => score.score));
+    const best = scores.filter(score => score.score === bestScore);
+    if (result.winnerNodeId !== null && (typeof result.winnerNodeId !== 'string' || !candidateIds.has(result.winnerNodeId))) throw new Error('Judge winner must be a direct predecessor or null for a tie.');
+    if (best.length === 1 ? result.winnerNodeId !== best[0].nodeId : result.winnerNodeId !== null) throw new Error('Judge winner must match the highest score; tied highest scores require a null winner.');
+    report.judgment = { winnerNodeId: result.winnerNodeId as string | null, reasoning: result.reasoning, scores };
+  }
+  return report;
 }

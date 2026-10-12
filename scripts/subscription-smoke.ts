@@ -58,7 +58,7 @@ try {
   const context: ExecutionContext = {
     node, models: [{ id: 'subscription', name: 'Fixture subscription', provider: 'openai', modelId: 'fixture-supervisor', kind: 'cloud', baseUrl: 'https://api.openai.com/v1', apiKeyEnv: '', enabled: true, authMethod: 'chatgpt', chatgptProfileId: 'fixture-profile', contextWindow: 32768 }],
     workflow: { id: 'fixture', name: 'Fixture', description: '', nodes: [node], edges: [], settings: { mode: 'once', maxCycles: 1, intervalSeconds: 0, entryNodeId: node.id, projectPath, previewUrl: '', executionMode: 'pi', codeMode: true } },
-    run: { id: 'fixture', status: 'running', mode: 'pi', startedAt: new Date().toISOString(), cycle: 1, steps: 0 }, cycle: 1, messages: [], findings: [], signal: new AbortController().signal,
+    run: { id: 'fixture', status: 'running', mode: 'pi', startedAt: new Date().toISOString(), cycle: 1, steps: 0 }, cycle: 1, messages: [], findings: [], upstreamResults: [], signal: new AbortController().signal,
   };
   const execute = createPiExecutor(stateDirectory, { chatgpt: service });
   const report = await execute(context);

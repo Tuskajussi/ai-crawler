@@ -13,6 +13,7 @@ import type { PreparedSource } from './knowledge-media';
 import { KnowledgeService } from './knowledge';
 import { sourceDirectoryName } from './knowledge-store';
 import { createApp } from './index';
+import { authenticatedFixture, fixtureRegistrationSecret } from './test-auth';
 
 const local: EmbeddingConfig = { ...defaultEmbeddingConfig, provider: 'compatible', kind: 'local', baseUrl: 'http://127.0.0.1:11434/v1', apiKeyEnv: '', modelId: 'test-embedding', dimensions: 3 };
 const cloud: EmbeddingConfig = { ...defaultEmbeddingConfig, provider: 'vertex', apiKeyEnv: '', projectId: 'test-project', dimensions: 128 };
@@ -337,13 +338,13 @@ test('shutdown during preview expiry cannot admit a later preparation or embeddi
 test('the HTTP preview route rejects a second upload before buffering while an earlier preparation is active', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'crawlspace-knowledge-upload-admission-'));
   const began = deferred<void>(); const release = deferred<void>(); let preparations = 0;
-  const runtime = await createApp({ statePath: path.join(directory, 'state.json'), knowledgeOptions: { prepare: async source => {
+  const runtime = await authenticatedFixture(await createApp({ registrationSecret: fixtureRegistrationSecret, statePath: path.join(directory, 'state.json'), knowledgeOptions: { prepare: async source => {
     if (++preparations === 1) { began.resolve(); await release.promise; }
     return prepared(source.name, ['fixture']);
-  }, embed: async config => unit(config.dimensions) } });
+  }, embed: async config => unit(config.dimensions) } }));
   const server = runtime.app.listen(0, '127.0.0.1'); await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const upload = (name: string) => fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(name), 'X-File-Type': 'text/plain' }, body: 'A source paragraph.' });
+  const upload = (name: string) => fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', ...runtime.authHeaders, 'X-File-Name': encodeURIComponent(name), 'X-File-Type': 'text/plain' }, body: 'A source paragraph.' });
   try {
     const first = upload('first.txt'); await began.promise;
     const rejected = await upload('blocked.txt'); assert.equal(rejected.status, 409); assert.equal(preparations, 1);
@@ -373,12 +374,16 @@ test('a failed index save removes already written media artifacts and retains no
 
 test('the HTTP knowledge flow previews locally, embeds explicitly, searches, downloads, exports and deletes persisted chunks', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'crawlspace-knowledge-api-')); let calls = 0;
-  const runtime = await createApp({ statePath: path.join(directory, 'state.json'), knowledgeOptions: { embed: async config => { calls++; return unit(config.dimensions); } } });
+  const runtime = await authenticatedFixture(await createApp({ registrationSecret: fixtureRegistrationSecret, statePath: path.join(directory, 'state.json'), knowledgeOptions: { embed: async config => { calls++; return unit(config.dimensions); } },
+    config: { modelEndpointOrigins: ['http://127.0.0.1:11434', 'https://aiplatform.eu.rep.googleapis.com'] } }));
   const server = runtime.app.listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const request = (route: string, method = 'GET', body?: unknown) => fetch(`${base}${route}`, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const request = (route: string, method = 'GET', body?: unknown) => fetch(`${base}${route}`, { method, headers: { 'Content-Type': 'application/json', ...runtime.authHeaders }, body: body === undefined ? undefined : JSON.stringify(body) });
   try {
+    assert.equal((await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': 'private.txt', 'X-File-Type': 'text/plain' }, body: 'private upload' })).status, 401);
+    assert.equal((await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', Cookie: runtime.authHeaders.Cookie, 'X-File-Name': 'private.txt', 'X-File-Type': 'text/plain' }, body: 'private upload' })).status, 403);
+    assert.equal(calls, 0, 'Authentication and CSRF rejection must precede media preparation and embedding.');
     assert.equal((await request('/knowledge/config', 'PUT', local)).status, 200);
     const textResponse = await request('/knowledge/preview', 'POST', { name: 'reference.txt', text: 'A reusable source paragraph.' }); assert.equal(textResponse.status, 200);
     const textPreview = await textResponse.json(); assert.equal(calls, 0); assert.equal(textPreview.chunks.length, 1);
@@ -394,11 +399,11 @@ test('the HTTP knowledge flow previews locally, embeds explicitly, searches, dow
     const download = await exported.json(); assert.deepEqual(download.source.chunks[0].vector, [1, 0, 0]); assert.ok(download.source.chunks[0].contentUrl.includes('/content'));
     const ordinaryState = await (await request('/state')).text(); assert.ok(!ordinaryState.includes('"vector"')); assert.ok(!ordinaryState.includes('A reusable source paragraph.'));
     assert.equal((await fetch(`${base}/knowledge/config`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Origin: 'https://untrusted.example' }, body: JSON.stringify(local) })).status, 403);
-    assert.equal((await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': '%bad', 'X-File-Type': 'text/plain' }, body: 'text' })).status, 400);
+    assert.equal((await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', ...runtime.authHeaders, 'X-File-Name': '%bad', 'X-File-Type': 'text/plain' }, body: 'text' })).status, 400);
 
     await request('/knowledge/config', 'PUT', cloud);
     const document = await PDFDocument.create(); document.addPage([200, 200]);
-    const rawPreviewResponse = await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent('guide.pdf'), 'X-File-Type': 'application/pdf' }, body: new Uint8Array(await document.save()) });
+    const rawPreviewResponse = await fetch(`${base}/knowledge/preview`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', ...runtime.authHeaders, 'X-File-Name': encodeURIComponent('guide.pdf'), 'X-File-Type': 'application/pdf' }, body: new Uint8Array(await document.save()) });
     assert.equal(rawPreviewResponse.status, 200); const rawPreview = await rawPreviewResponse.json(); const beforeCalls = calls;
     assert.equal((await request('/knowledge/index', 'POST', { previewId: rawPreview.id, allowCloudUpload: false })).status, 400); assert.equal(calls, beforeCalls);
     assert.equal((await request('/knowledge/index', 'POST', { previewId: rawPreview.id, allowCloudUpload: true })).status, 202); const pdfState = await finished(runtime.knowledge);
@@ -407,10 +412,10 @@ test('the HTTP knowledge flow previews locally, embeds explicitly, searches, dow
     assert.equal((await request('/knowledge/search', 'POST', { query: 'guide', allowCloudUpload: true })).status, 200);
     const pdfContent = await request(`/knowledge/sources/${pdfId}/chunks/${rawPreview.chunks[0].id}/content`); assert.equal(pdfContent.status, 200); assert.match(pdfContent.headers.get('content-disposition') ?? '', /\.pdf/);
     assert.equal((await PDFDocument.load(await pdfContent.arrayBuffer())).getPageCount(), 1);
-    assert.equal((await request(`/knowledge/sources/${sourceId}`, 'DELETE')).status, 200); assert.equal((await request(`/knowledge/sources/${pdfId}`, 'DELETE')).status, 200);
+    assert.equal((await request(`/knowledge/sources/${sourceId}`, 'DELETE', {})).status, 200); assert.equal((await request(`/knowledge/sources/${pdfId}`, 'DELETE', {})).status, 200);
     assert.equal((await request(`/knowledge/sources/${sourceId}/export`)).status, 404);
-    for (const filename of ['index.json', 'index.json.bak']) assert.equal(JSON.parse(await readFile(path.join(directory, 'knowledge', filename), 'utf8')).sources.length, 0);
-    assert.equal((await readdir(path.join(directory, 'knowledge'))).some(name => name.startsWith('source-')), false);
+    for (const filename of ['index.json', 'index.json.bak']) assert.equal(JSON.parse(await readFile(path.join(runtime.directory, 'knowledge', filename), 'utf8')).sources.length, 0);
+    assert.equal((await readdir(path.join(runtime.directory, 'knowledge'))).some(name => name.startsWith('source-')), false);
   } finally {
     await runtime.shutdown();
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

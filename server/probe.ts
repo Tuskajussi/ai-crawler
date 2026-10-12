@@ -2,7 +2,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ModelConfig } from '../shared/types';
-import { modelReadiness, providersConfig } from './pi';
+import { modelReadiness, providersConfig, resolvedModelBaseUrl } from './pi';
 import { adaptChatgptResponsesPayload, createChatgptFetch, type ChatgptService } from './chatgpt';
 import { fitRequestPayload } from './request-budget';
 
@@ -25,6 +25,13 @@ export async function probeModel(config: ModelConfig, stateDirectory: string, ch
   let unsubscribe: (() => void) | undefined;
   const onAbort = () => { void session?.abort(); };
   const apiKey = config.authMethod !== 'chatgpt' && config.apiKeyEnv ? process.env[config.apiKeyEnv] : undefined;
+  const fetcher = globalThis.fetch;
+  const endpointOrigin = new URL(resolvedModelBaseUrl(config)).origin;
+  const checkedFetch: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).origin !== endpointOrigin) throw new Error('The connection check tried to leave its configured model endpoint.');
+    return fetcher(request, { redirect: 'error' });
+  };
   try {
     const sdk: Record<string, any> = await import('@earendil-works/pi-coding-agent');
     const { Type } = await import('typebox');
@@ -51,11 +58,11 @@ export async function probeModel(config: ModelConfig, stateDirectory: string, ch
     } };
     ({ session } = await sdk.createAgentSession({ cwd: directory, agentDir: directory, modelRuntime, model, thinkingLevel: config.reasoningEffort ?? 'off', tools: ['connection_check'], customTools: [tool], resourceLoader, settingsManager, sessionManager: sdk.SessionManager.inMemory() }));
     const stream = session.agent.streamFunction;
-    const subscriptionFetch = config.authMethod === 'chatgpt' ? createChatgptFetch(chatgpt!, subscriptionProfileId) : undefined;
+    const subscriptionFetch = config.authMethod === 'chatgpt' ? createChatgptFetch(chatgpt!, subscriptionProfileId, fetcher) : undefined;
     session.agent.streamFunction = (requestModel: any, transcript: any, options: any) => {
       if (++requests > 3) throw new Error('The model did not complete the bounded connection check.');
       completed = false;
-      return stream(requestModel, transcript, { ...options, maxTokens: outputTokens, maxRetries: 0, transport: 'sse', ...(subscriptionFetch ? { fetch: subscriptionFetch } : {}),
+      return stream(requestModel, transcript, { ...options, maxTokens: outputTokens, maxRetries: 0, transport: 'sse', fetch: subscriptionFetch ?? checkedFetch,
         ...(config.reasoningEffort && ['custom', 'ollama'].includes(config.provider) ? { samplingParams: { ...options?.samplingParams, reasoning_effort: config.reasoningEffort } } : {}),
         onPayload: async (payload: unknown, requestedModel: any) => {
           const replacement = await options?.onPayload?.(payload, requestedModel);

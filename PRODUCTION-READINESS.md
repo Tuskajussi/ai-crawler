@@ -30,6 +30,16 @@ The full backend suite passed **220/220 tests with no skips** at the integration
 
 The focused reliability browser check passed empty/error/stale states, failure categories, configuration filters, exact rate denominators, refresh/poll cleanup and mobile layout. Its unmocked phase verifies the actual tracker-to-durable-store-to-API-to-dashboard path and confirms private tool inputs/results are absent from saved history. Desktop and mobile screenshots were visually inspected. These checks use local fixtures and do not call the intended models.
 
+## Authentication and hosting integration, 12 October 2026
+
+The remote authentication/hosting implementation is integrated with local models, Code Mode, decision routing, knowledge indexes, reliability tracking and the refreshed UI. Accounts have private workspaces and cookie/CSRF protection, including binary knowledge uploads. The first account inherits legacy workflow, screenshot, knowledge, reliability and ChatGPT association data without deleting the originals. Local copies retain operator-controlled endpoint/key allowlists and private project roots; approve the intended LAN inference origins before connecting them. Hosted browser sign-in cannot initiate the loopback ChatGPT flow.
+
+Comparison candidates receive independent snapshots before endpoint queuing, and judges receive every current-cycle predecessor output. Supervisor review carries the primary evidence and a bounded draft while retaining independent inputs. Judge preflight rejects insufficient/circular candidates before inference. Workflow and endpoint limits, bounded output history, cancellation/draining, retries and tool-call telemetry remain active. Legacy workflow cycles stay bounded and sequential within their cycle component.
+
+Validation passed: **265/265 backend tests with no skips**, typecheck, production frontend/server build, actual-Pi/Code Mode smoke, mocked subscription and parallel smokes, and authenticated workflow, UX, Knowledge and reliability browser checks. A focused auth browser regression verifies that delayed responses from revoked sessions cannot sign out a newer account or clear its cookie. The compiled-server smoke also verifies the separate PDF worker, binary-upload CSRF, hosted headers/cookies, login/logout and session persistence after restart. The Docker recipe includes FFmpeg for audio/video preparation; the native host must install it separately. Docker/Ubuntu deployment itself was not executed here. The main bundle advisory remains (about 615 kB minified, 188 kB compressed).
+
+These checks use loopback or mock inference and isolated test accounts. The real machines, real model quality, subscription eligibility, public hosting and sustained-use release gates in this document remain unverified.
+
 ## Implementation follow-up
 
 | Original gap | Current outcome | Remaining deployment check |

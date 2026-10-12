@@ -6,9 +6,13 @@ import path from 'node:path';
 import { chromium, type Locator, type Page } from 'playwright';
 import { createServer } from 'vite';
 import { createApp } from '../server/index';
+import { createTestAccount, signInPage, testRegistrationSecret } from './test-auth';
 
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-ux-'));
-const { app, store, engine, shutdown } = await createApp({ statePath: path.join(temporary, 'state.json'), demoStepMs: 2000 });
+const runtime = await createApp({ dataDir: temporary, registrationSecret: testRegistrationSecret, demoStepMs: 2000 });
+const { app, shutdown } = runtime;
+const account = await createTestAccount(runtime, 'ux-tester');
+const { store, engine } = account.workspace;
 await store.update(state => {
   state.workflow.settings.mode = 'once';
   state.workflow.settings.executionMode = 'demo';
@@ -109,6 +113,7 @@ try {
   });
   await mkdir('.crawlspace/previews', { recursive: true });
   await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+  await signInPage(page, account);
   await page.getByText('Local runner ready', { exact: true }).waitFor();
   const nav = page.getByRole('navigation', { name: 'Main navigation', exact: true });
   for (const group of ['Workspace', 'Resources', 'Insights']) await nav.getByText(group, { exact: true }).waitFor();
@@ -222,6 +227,17 @@ try {
   await navigate(pages[0]);
   const priorNodeCount = await page.locator('.react-flow__node').count();
   const priorBodyOverflow = await page.evaluate(() => document.body.style.overflow);
+  const mobileMenu = page.getByRole('button', { name: 'Open navigation', exact: true });
+  await mobileMenu.click();
+  await page.getByRole('button', { name: 'Change password', exact: true }).click();
+  const passwordDialog = page.getByRole('dialog', { name: 'A new key to your workspace.', exact: true });
+  await passwordDialog.waitFor();
+  await page.waitForFunction(() => document.activeElement?.id === 'account-current-password');
+  await trapFocus(passwordDialog); await overflow('390px change password'); await screenshot('password-390');
+  assert.equal(await page.locator('.workspace-main').evaluate(element => element.hasAttribute('inert')), true, 'The password dialog prevents workspace interaction');
+  await page.keyboard.press('Escape'); await passwordDialog.waitFor({ state: 'hidden' });
+  assert.equal(await mobileMenu.evaluate(element => element === document.activeElement), true, 'Closing password settings returns focus to the mobile menu');
+  assert.equal(await page.evaluate(() => document.body.style.overflow), priorBodyOverflow, 'Opening password settings from navigation restores page scrolling on close');
   await add.click(); await library.waitFor();
   await library.getByRole('button', { name: 'Preview Custom agent', exact: true }).click();
   await library.getByRole('button', { name: 'Back to templates', exact: true }).waitFor();
@@ -244,9 +260,9 @@ try {
   await page.waitForFunction(() => document.activeElement?.classList.contains('react-flow__node') && document.activeElement.textContent?.includes('Custom agent'));
   assert.equal(await newNode.evaluate(element => element === document.activeElement), true, 'New agent settings restore focus to the newly mounted node');
   assert.equal(await page.evaluate(() => document.body.style.overflow), priorBodyOverflow, 'Closing new agent settings restores page scrolling');
-  assert.deepEqual(unexpectedRequests, [], 'Browsing and UX checks never probe models, sign in, upload sources, create embeddings or search providers');
+  assert.deepEqual(unexpectedRequests, [], 'Browsing and UX checks never probe models, sign in to providers, upload sources, create embeddings or search providers');
   assert.deepEqual(errors, [], 'No browser runtime errors');
-  console.log('UX smoke passed: grouped/current navigation, model shelves and filters, long assignments, recipient guidance, dialog keyboard traps and focus restoration, Enter/Space agent activation, drawer Delete protection, new-agent focus and scroll restoration, live-run editing locks, and eight pages without overflow at 320/390/768/1280/1512px. Screenshots saved as .crawlspace/previews/ux-*.png. No model or cloud requests were made.');
+  console.log('UX smoke passed: grouped/current navigation, model shelves and filters, long assignments, recipient guidance, dialog keyboard traps and focus restoration, Enter/Space agent activation, drawer Delete protection, mobile password focus and scroll restoration, new-agent focus and scroll restoration, live-run editing locks, and eight pages without overflow at 320/390/768/1280/1512px. Screenshots saved as .crawlspace/previews/ux-*.png. No model or cloud requests were made.');
 } catch (failure) {
   await screenshot('failure').catch(() => {});
   if (page) console.error('UX failure context:', { viewport: page.viewportSize(), dialogs: await page.getByRole('dialog').allTextContents(), focused: await page.evaluate(() => document.activeElement?.outerHTML.slice(0, 500)) });

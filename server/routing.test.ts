@@ -12,7 +12,7 @@ function context(settings: Partial<RoutingSettings> = {}, signal = new AbortCont
   state.workflow.settings.projectPath = 'C:\\private\\project';
   state.workflow.settings.supervisorModelId = 'claude';
   state.workflow.nodes[0].data.modelId = 'qwen';
-  return { ...state, node: state.workflow.nodes[0], cycle: 1, signal,
+  return { ...state, node: state.workflow.nodes[0], cycle: 1, signal, upstreamResults: [],
     run: { id: 'routing-run', status: 'running', mode: 'pi', startedAt: new Date().toISOString(), cycle: 1, steps: 0 } };
 }
 

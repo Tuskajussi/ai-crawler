@@ -10,10 +10,12 @@ export const roleMeta: Record<AgentRole, {label: string; color: string; descript
   designer: {label:'UI inspector', color:'purple', description:'A fresh pair of eyes on every screen'},
   reviewer: {label:'Code reviewer', color:'orange', description:'Turns observations into clear findings'},
   coordinator: {label:'Coordinator', color:'teal', description:'Keeps the whole team in sync'},
+  judge: {label:'Judge', color:'gold', description:'Compares every answer before choosing'},
   custom: {label:'Custom agent', color:'gray', description:'Your role. Your instructions.'}
 };
 export function makeAgent(role: AgentRole, modelId = 'claude'): AgentData {
  const meta = roleMeta[role];
+ if(role==='judge') return {label:meta.label,role,color:meta.color,description:meta.description,modelId,status:'idle',tools:['read'],persona:'You are an impartial judge. Compare every candidate against the same original problem and cite evidence. Do not prefer a particular provider or a longer response.',prompt:'Compare the separate upstream answers against the original problem and your rubric. Score every candidate, explain strengths and weaknesses, and select a winner or declare a tie.',responsibilities:['Compare candidate answers','Explain scores & winner'],judgeRubric:'Correctness (40%), evidence (30%), completeness (20%), clarity (10%). Select no winner when there is a tie or insufficient evidence.'};
  return {label:meta.label,role,color:meta.color,description:meta.description,modelId,status:'idle',tools:role==='designer'?['read','screenshot']:['read'],persona:`You are a thoughtful ${meta.label.toLowerCase()}. Be specific, verify your observations, and coordinate with the staff directory.`,prompt:'Review your assigned area. Report actionable problems with file paths and evidence. Share your findings and pass useful context to the next agent.',responsibilities:[role==='designer'?'Visual quality & accessibility':role==='tester'?'Test coverage & edge cases':role==='coordinator'?'Triage & task assignments':'Code quality & correctness']};
 }
 const stamp = new Date().toISOString();

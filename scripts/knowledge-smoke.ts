@@ -8,6 +8,7 @@ import { chromium, type Page } from 'playwright';
 import { createServer } from 'vite';
 import { PDFDocument } from 'pdf-lib';
 import { createApp } from '../server/index';
+import { createTestAccount, signInPage, testRegistrationSecret } from './test-auth';
 import { defaultEmbeddingConfig, type EmbeddingConfig, type KnowledgeChunk, type KnowledgePreview, type KnowledgeSearchResult, type KnowledgeStatus } from '../shared/knowledge';
 
 // These fixtures test browser consent and presentation. Backend/provider tests cover real embeddings and media preparation.
@@ -24,7 +25,9 @@ const provider = createHttpServer(async (request, response) => {
 provider.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => provider.once('listening', resolve));
 const providerAddress = provider.address(); assert(providerAddress && typeof providerAddress !== 'string');
-const { app, shutdown } = await createApp({ statePath: path.join(temporary, 'state.json') });
+const runtime = await createApp({ dataDir: temporary, registrationSecret: testRegistrationSecret, config: { hosted: false, modelEndpointOrigins: [`http://127.0.0.1:${providerAddress.port}`] } });
+const { app, shutdown } = runtime;
+const account = await createTestAccount(runtime, 'knowledge-tester');
 const apiServer = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => apiServer.once('listening', resolve));
 const address = apiServer.address();
@@ -121,6 +124,7 @@ try {
   });
   await mkdir('.crawlspace/previews', { recursive: true });
   await page.goto('http://127.0.0.1:5191', { waitUntil: 'domcontentloaded' });
+  await signInPage(page, account);
   await page.getByRole('button', { name: 'Knowledge', exact: true }).click();
   await page.getByText(status.readiness.message, { exact: true }).waitFor();
   assert.equal(createBodies.length + searchBodies.length, 0, 'Opening Knowledge must not call an embedding provider');
@@ -273,7 +277,7 @@ try {
   const exportPath = await (await actualExportPromise).path(); assert(exportPath);
   const exported = JSON.parse(await readFile(exportPath, 'utf8')) as { source: { chunks: { vector: number[] }[] } };
   assert.deepEqual(exported.source.chunks[0].vector, [1, 0, 0], 'Export contains actual saved normalized vectors');
-  const saved = JSON.parse(await readFile(path.join(temporary, 'knowledge', 'index.json'), 'utf8')) as { sources: { name: string }[] };
+  const saved = JSON.parse(await readFile(path.join(account.workspace.directory, 'knowledge', 'index.json'), 'utf8')) as { sources: { name: string }[] };
   assert.equal(saved.sources[0].name, 'API integration source', 'The browser action commits a durable local source');
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.getByRole('button', { name: 'Knowledge', exact: true }).click();

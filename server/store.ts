@@ -3,13 +3,18 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { initialState } from '../shared/defaults';
 import type { AppState } from '../shared/types';
-import { validateModels, validateWorkflow, validateRoutingDecisions } from './validation';
+import { InputError, validateModels, validateWorkflow, validateRoutingDecisions } from './validation';
 
 type StoreOptions = { beforeCommit?: (phase: 'backup' | 'primary') => void | Promise<void> };
 
 function savedState(input: unknown): AppState {
   if (!input || typeof input !== 'object') throw new Error('Saved workspace must be an object.');
   const state = input as AppState;
+  // Honor the previous hosted branch's setting before current defaults are applied.
+  if (state.workflow?.settings?.maxParallel !== undefined) {
+    state.workflow.settings.maxParallelAgents ??= state.workflow.settings.maxParallel;
+    delete state.workflow.settings.maxParallel;
+  }
   validateModels(state.models);
   validateWorkflow(state.workflow, state.models);
   const text = (value: unknown, maximum: number) => typeof value === 'string' && value.length > 0 && value.length <= maximum;
@@ -34,12 +39,29 @@ function savedState(input: unknown): AppState {
     || (run.decisionCount !== undefined && (!Number.isSafeInteger(run.decisionCount) || run.decisionCount < 0))
     || (run.escalations !== undefined && (!Number.isInteger(run.escalations) || run.escalations < 0)))) throw new Error('Saved workspace has invalid runs.');
   for (const run of state.runs) if (run.decisions !== undefined) validateRoutingDecisions(run.decisions);
+  for (const run of state.runs) if (run.results !== undefined) {
+    if (!Array.isArray(run.results) || run.results.length > 200) throw new Error('Saved workspace has invalid node results.');
+    for (const result of run.results) {
+      if (!result || !text(result.nodeId, 100) || !text(result.nodeName, 200) || !text(result.modelId, 300)
+        || !Number.isSafeInteger(result.cycle) || result.cycle < 1 || !text(result.output, 30_000) || !date(result.completedAt)
+        || !Array.isArray(result.findings) || result.findings.length > 30 || result.findings.some(finding => !finding
+          || !text(finding.title, 300) || !text(finding.description, 10_000) || !['critical', 'high', 'medium', 'low'].includes(finding.severity)
+          || (finding.file !== undefined && !text(finding.file, 4000)) || (finding.line !== undefined && (!Number.isSafeInteger(finding.line) || finding.line < 1))
+          || (finding.screenshot !== undefined && !text(finding.screenshot, 2000)) || (finding.demo !== undefined && typeof finding.demo !== 'boolean'))) throw new Error('Saved workspace has invalid node results.');
+      const judgment = result.judgment;
+      if (judgment !== undefined && (!judgment || !text(judgment.reasoning, 10_000)
+        || (judgment.winnerNodeId !== null && !text(judgment.winnerNodeId, 100)) || !Array.isArray(judgment.scores)
+        || judgment.scores.length < 1 || judgment.scores.length > 100 || new Set(judgment.scores.map(score => score?.nodeId)).size !== judgment.scores.length
+        || judgment.scores.some(score => !score || !text(score.nodeId, 100) || !Number.isFinite(score.score) || score.score < 0 || score.score > 100 || !text(score.reasoning, 10_000))
+        || (judgment.winnerNodeId !== null && !judgment.scores.some(score => score.nodeId === judgment.winnerNodeId)))) throw new Error('Saved workspace has an invalid judgment.');
+    }
+  }
   return state;
 }
 
 async function atomicWrite(filePath: string, contents: string): Promise<void> {
   const temporary = `${filePath}.tmp`;
-  const handle = await open(temporary, 'w');
+  const handle = await open(temporary, 'w', 0o600);
   try { await handle.writeFile(contents, 'utf8'); await handle.sync(); }
   finally { await handle.close(); }
   await rename(temporary, filePath);
@@ -101,11 +123,12 @@ export class StateStore {
   async update(mutate: (state: AppState) => void): Promise<AppState> {
     // Mutate only after earlier commits finish; publish only after the durable replacement.
     let committed!: AppState;
+    let rejectedInput = false;
     const write = this.writes.catch(() => {}).then(async () => {
       const next = structuredClone(this.state);
-      mutate(next);
-      savedState(next);
-      await mkdir(path.dirname(this.filePath), { recursive: true });
+      try { mutate(next); savedState(next); }
+      catch (error) { rejectedInput = error instanceof InputError; throw error; }
+      await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       await this.options.beforeCommit?.('backup');
       await atomicWrite(`${this.filePath}.bak`, JSON.stringify(this.state, null, 2));
       await this.options.beforeCommit?.('primary');
@@ -114,7 +137,13 @@ export class StateStore {
       committed = structuredClone(next);
     });
     this.writes = write;
-    await write;
+    try { await write; }
+    catch (error) {
+      // A rejected API mutation never entered the writer. Keep real disk failures
+      // observable to shutdown, while an expected 400/404 does not poison flush.
+      if (rejectedInput && this.writes === write) this.writes = Promise.resolve();
+      throw error;
+    }
     return committed;
   }
 

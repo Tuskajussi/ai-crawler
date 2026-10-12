@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { defaultRoutingSettings } from '../shared/defaults';
 import { createApp } from './index';
+import { authenticatedFixture, fixtureRegistrationSecret } from './test-auth';
 
 test('decision probes use a synthetic assignment, validate native protocol, and share the active run lock', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'crawlspace-routing-probe-'));
@@ -20,13 +21,14 @@ test('decision probes use a synthetic assignment, validate native protocol, and 
     response.end(JSON.stringify({ model: 'self-hosted-decision-v1', answers: { [key]: { type: 'choice', choice: 'assigned', probabilities: { assigned: 0.99, supervisor: 0.005, review: 0.005 }, confidence: 0.98 } }, usage: { input_tokens: 40, output_tokens: 0 } }));
   });
   await new Promise<void>(resolve => inference.listen(0, '127.0.0.1', resolve));
-  const runtime = await createApp({ statePath: path.join(directory, 'state.json'), demoStepMs: 60_000, chatgptOptions: { credentialDirectory: path.join(directory, 'credentials') } });
+  const runtime = await authenticatedFixture(await createApp({ registrationSecret: fixtureRegistrationSecret, statePath: path.join(directory, 'state.json'), demoStepMs: 60_000, chatgptOptions: { credentialDirectory: path.join(directory, 'credentials') },
+    config: { modelEndpointOrigins: [`http://127.0.0.1:${(inference.address() as { port: number }).port}`] } }));
   await runtime.store.update(state => { state.workflow.nodes[0].data.prompt = 'PRIVATE_PROBE_PROJECT_PROMPT'; state.messages[0].text = 'PRIVATE_PROBE_SHARED_EVIDENCE'; });
   const server = runtime.app.listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api`;
   const routing = { ...defaultRoutingSettings, mode: 'shadow', baseUrl: `http://127.0.0.1:${(inference.address() as { port: number }).port}/v1`, modelId: 'self-hosted-decision-v1', apiKeyEnv: '' };
-  const post = (route: string, body: unknown) => fetch(`${base}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const post = (route: string, body: unknown) => fetch(`${base}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...runtime.authHeaders }, body: JSON.stringify(body) });
   try {
     let response = await post('/routing/probe', routing);
     assert.equal(response.status, 200);

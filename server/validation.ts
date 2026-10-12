@@ -5,7 +5,7 @@ export class InputError extends Error {
 }
 
 const identifier = /^[a-zA-Z0-9_-]{1,100}$/;
-const roles = new Set(['crawler', 'tester', 'designer', 'reviewer', 'coordinator', 'custom']);
+const roles = new Set(['crawler', 'tester', 'designer', 'reviewer', 'coordinator', 'judge', 'custom']);
 const modelFields = new Set(['id', 'name', 'provider', 'modelId', 'kind', 'baseUrl', 'apiKeyEnv', 'enabled', 'contextWindow', 'supportsImages', 'maxOutputTokens', 'timeoutSeconds', 'reasoningEffort', 'authMethod', 'chatgptProfileId', 'maxConcurrentRequests']);
 
 function text(value: unknown, label: string, maximum = 20_000, allowEmpty = true): asserts value is string {
@@ -113,6 +113,7 @@ export function validateModels(input: unknown): asserts input is ModelConfig[] {
 export function traversalOrder(workflow: Workflow): string[] {
   const outgoing = new Map<string, string[]>();
   for (const edge of workflow.edges) {
+    if (edge.data?.loop === true) continue;
     const targets = outgoing.get(edge.source) ?? [];
     targets.push(edge.target);
     outgoing.set(edge.source, targets);
@@ -148,6 +149,7 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
     text(data.description, 'Agent description', 5000);
     text(data.persona, 'Agent persona');
     text(data.prompt, 'Agent prompt');
+    if (data.judgeRubric !== undefined) text(data.judgeRubric, 'Judge rubric');
     text(data.color, 'Agent color', 50, false);
     if (!roles.has(data.role)) throw new InputError(`Unsupported role on ${data.label}.`);
     if (!Array.isArray(data.tools) || data.tools.some(tool => !['read', 'screenshot'].includes(tool))) throw new InputError(`Invalid tools on ${data.label}.`);
@@ -163,6 +165,8 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
     edgeIds.add(edge.id);
     if (!ids.has(edge.source) || !ids.has(edge.target)) throw new InputError(`Connection ${edge.id} points to a missing agent.`);
     if (edge.label !== undefined) text(edge.label, 'Connection label', 200);
+    if (edge.data !== undefined && (!edge.data || typeof edge.data !== 'object' || Array.isArray(edge.data)
+      || (edge.data.loop !== undefined && typeof edge.data.loop !== 'boolean'))) throw new InputError(`Connection ${edge.id} must use a boolean loop flag.`);
   }
   const settings = workflow.settings;
   if (!settings || !['loop', 'once'].includes(settings.mode) || !['demo', 'pi'].includes(settings.executionMode)) throw new InputError('Invalid workflow execution settings.');
@@ -176,6 +180,7 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
   }
   if (settings.maxEscalationsPerCycle !== undefined && (!Number.isInteger(settings.maxEscalationsPerCycle) || settings.maxEscalationsPerCycle < 1 || settings.maxEscalationsPerCycle > 10)) throw new InputError('Maximum supervisor visits per cycle must be a whole number from 1 to 10.');
   if (settings.maxEscalationsPerRun !== undefined && (!Number.isInteger(settings.maxEscalationsPerRun) || settings.maxEscalationsPerRun < 1 || settings.maxEscalationsPerRun > 100)) throw new InputError('Maximum supervisor visits per run must be a whole number from 1 to 100.');
+  if (settings.maxParallel !== undefined && (!Number.isInteger(settings.maxParallel) || settings.maxParallel < 1 || settings.maxParallel > 8)) throw new InputError('Parallel agents must be an integer from 1 to 8.');
   if (!Number.isInteger(settings.maxCycles) || settings.maxCycles < 1 || settings.maxCycles > 1000) throw new InputError('Maximum cycles must be an integer from 1 to 1,000.');
   if (!Number.isFinite(settings.intervalSeconds) || settings.intervalSeconds < 0 || settings.intervalSeconds > 86400) throw new InputError('Cycle interval must be from 0 to 86,400 seconds.');
   if (!ids.has(settings.entryNodeId)) throw new InputError('Choose an entry agent that exists in the workflow.');
@@ -184,6 +189,17 @@ export function validateWorkflow(input: unknown, models: ModelConfig[]): asserts
   const reachable = new Set(traversalOrder(workflow));
   const disconnected = workflow.nodes.filter(node => !reachable.has(node.id));
   if (disconnected.length) throw new InputError(`Connect all agents to the entry agent. Unreachable: ${disconnected.map(node => node.data.label).join(', ')}.`);
+  for (const judge of workflow.nodes.filter(node => node.data.role === 'judge')) {
+    const normalEdges = workflow.edges.filter(edge => edge.data?.loop !== true && edge.target !== settings.entryNodeId);
+    const parents = new Set(normalEdges.filter(edge => edge.target === judge.id).map(edge => edge.source));
+    if (parents.size < 2) throw new InputError(`${judge.data.label} needs at least two distinct candidate agents connected as direct predecessors.`);
+    const descendants = new Set<string>([judge.id]);
+    const queue = [judge.id];
+    for (let index = 0; index < queue.length; index++) for (const edge of normalEdges.filter(edge => edge.source === queue[index])) {
+      if (!descendants.has(edge.target)) { descendants.add(edge.target); queue.push(edge.target); }
+    }
+    if ([...parents].some(parent => descendants.has(parent))) throw new InputError(`${judge.data.label}'s candidates must finish before judging. Mark cycle-return connections as Next cycle.`);
+  }
 }
 
 export function localPreviewUrl(value: string): URL {

@@ -1,3 +1,4 @@
+import { apiFetch } from './api';
 import { useEffect, useMemo, useState } from 'react';
 import { Activity, Check, CircleAlert, Cloud, Code2, Cpu, LoaderCircle, RefreshCw, Wrench } from 'lucide-react';
 import type { AppState } from '../shared/types';
@@ -69,7 +70,7 @@ export function ReliabilityPanel({ state }: { state: AppState }) {
       const timeout = setTimeout(() => controller?.abort(), 15_000);
       setLoading(true);
       try {
-        const response = await fetch('/api/reliability', { signal: controller.signal });
+        const response = await apiFetch('/reliability', { signal: controller.signal });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `History request failed (${response.status})`);
         if (stopped) return;

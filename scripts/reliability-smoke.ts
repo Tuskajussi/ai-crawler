@@ -5,12 +5,16 @@ import path from 'node:path';
 import { chromium, type Page } from 'playwright';
 import { createServer } from 'vite';
 import { createApp } from '../server/index';
+import { createTestAccount, signInPage, testRegistrationSecret } from './test-auth';
 import { ReliabilityVisitTracker } from '../server/reliability';
 import type { ModelConfig } from '../shared/types';
 import { reliabilityOutcomes, type ModelReliabilitySummary, type ReliabilityModel, type ReliabilitySnapshot, type ReliabilityToolCall, type ReliabilityToolName, type ReliabilityToolSummary, type ReliabilityVisit } from '../shared/reliability';
 
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'crawlspace-reliability-ui-'));
-const { app, reliability, shutdown } = await createApp({ statePath: path.join(temporary, 'state.json') });
+const runtime = await createApp({ dataDir: temporary, registrationSecret: testRegistrationSecret });
+const { app, shutdown } = runtime;
+const account = await createTestAccount(runtime, 'reliability-tester');
+const { reliability } = account.workspace;
 const apiServer = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => apiServer.once('listening', resolve));
 const apiAddress = apiServer.address(); assert(apiAddress && typeof apiAddress !== 'string');
@@ -63,6 +67,7 @@ try {
   });
   await mkdir('.crawlspace/previews', { recursive: true });
   await page.goto(`http://127.0.0.1:${viteAddress.port}`, { waitUntil: 'domcontentloaded' });
+  await signInPage(page, account);
   const nav = page.getByRole('button', { name: 'Tool reliability', exact: true });
   await nav.click();
   await page.getByRole('heading', { name: 'No measured visits yet', exact: true }).waitFor();

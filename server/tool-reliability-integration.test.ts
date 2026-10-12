@@ -94,7 +94,7 @@ async function fixture(t: TestContext, respond: (request: ModelRequest, response
   const context: ExecutionContext = {
     workflow: { id: 'fixture', name: 'Reliability fixture', description: 'Local tool integration', nodes: [node], edges: [], settings: { mode: 'once', maxCycles: 1, intervalSeconds: 0, entryNodeId: node.id, projectPath, previewUrl: '', executionMode: 'pi', codeMode: false } },
     models: [{ id: 'fixture', name: 'Fixture model', provider: 'custom', modelId: 'fixture-coder', kind: 'local', baseUrl: `${origin}/v1`, apiKeyEnv: '', enabled: true, contextWindow: 32768, maxOutputTokens: 1024, timeoutSeconds: 30, supportsImages: false }],
-    node, run: { id: 'fixture-run', status: 'running', mode: 'pi', startedAt: new Date().toISOString(), cycle: 1, steps: 0 }, cycle: 1, messages: [], findings: [], signal: new AbortController().signal,
+    node, run: { id: 'fixture-run', status: 'running', mode: 'pi', startedAt: new Date().toISOString(), cycle: 1, steps: 0 }, cycle: 1, messages: [], findings: [], upstreamResults: [], signal: new AbortController().signal,
   };
   t.after(async () => {
     for (const cleanup of beforeCleanup) await cleanup();
@@ -361,41 +361,60 @@ test('API reliability survives app restart and keeps configurations separate, in
     if (count % 3 !== 0) toolCalls(response, [{ id: 'reused-provider-call-id', name: 'project_read', args: { path: 'app.ts' } }]);
     else completion(response);
   });
-  const statePath = path.join(current.directory, 'state.json');
-  let application = await createApp({ statePath });
+  const dataDir = path.join(current.directory, 'api-accounts');
+  const registrationSecret = 'fixture-registration-secret-with-at-least-32-characters';
+  const options = { dataDir, registrationSecret, config: { modelEndpointOrigins: [new URL(current.context.models[0].baseUrl).origin] } };
+  let application = await createApp(options);
   let http = createServer(application.app);
   let origin = await listen(http);
+  current.beforeCleanup.push(async () => { await application.shutdown(); await close(http); });
+  let cookie = '';
+  let csrfToken = '';
+  const request = async (endpoint: string, method = 'GET', body?: unknown) => fetch(`${origin}/api${endpoint}`, {
+    method, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(method !== 'GET' && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const registered = await request('/auth/register', 'POST', { username: 'reliability-user', password: 'fixture sufficiently long account password', registrationSecret });
+  assert.equal(registered.status, 201);
+  cookie = registered.headers.get('set-cookie')!.split(';')[0];
+  const session = await registered.json() as { user: { id: string }; csrfToken: string };
+  csrfToken = session.csrfToken;
+  let workspace = await application.workspaces.get(session.user.id);
+  const projectPath = path.join(workspace.projectsRoot, 'fixture');
+  await mkdir(projectPath);
+  await writeFile(path.join(projectPath, 'app.ts'), await readFile(path.join(current.context.workflow.settings.projectPath, 'app.ts')));
   const apiSnapshot = async (): Promise<ReliabilitySnapshot> => {
-    const response = await fetch(`${origin}/api/reliability`);
+    const response = await request('/reliability');
     assert.equal(response.status, 200);
     return response.json();
   };
-  current.beforeCleanup.push(async () => { await application.shutdown(); await close(http); });
-  await application.store.update(state => {
+  await workspace.store.update(state => {
     state.workflow = structuredClone(current.context.workflow);
+    state.workflow.settings.projectPath = projectPath;
     state.models = structuredClone(current.context.models);
     state.messages = []; state.findings = []; state.runs = [];
   });
-  await application.engine.start('pi');
-  await application.engine.waitForIdle();
-  assert.equal(application.store.get().runs[0].status, 'completed');
+  assert.equal((await request('/runs', 'POST', { mode: 'pi' })).status, 202);
+  await workspace.engine.waitForIdle();
+  assert.equal(workspace.store.get().runs[0].status, 'completed', workspace.store.get().runs[0].error);
   let snapshot = await apiSnapshot();
   assert.equal(snapshot.models.length, 1);
   assert.equal(snapshot.models[0].tools.total, 2, 'A provider may reuse call IDs in later assistant messages.');
-  assertPrivateContentExcluded(JSON.stringify(snapshot), current.context.workflow.settings.projectPath);
+  assertPrivateContentExcluded(JSON.stringify(snapshot), projectPath);
   await application.shutdown();
   await close(http);
-  application = await createApp({ statePath });
+  application = await createApp(options);
   http = createServer(application.app);
   origin = await listen(http);
-  assert.deepEqual((await apiSnapshot()).models, snapshot.models);
-  await application.store.update(state => { state.models[0].reasoningEffort = 'low'; });
-  await application.engine.start('pi');
-  await application.engine.waitForIdle();
+  workspace = await application.workspaces.get(session.user.id);
+  assert.deepEqual((await apiSnapshot()).models, snapshot.models, 'The real authenticated session and private history survive restart.');
+  await workspace.store.update(state => { state.models[0].reasoningEffort = 'low'; });
+  assert.equal((await request('/runs', 'POST', { mode: 'pi' })).status, 202);
+  await workspace.engine.waitForIdle();
   snapshot = await apiSnapshot();
   assert.equal(snapshot.models.length, 2, 'Changing model execution settings starts a distinct comparison group.');
   assert.deepEqual(snapshot.models.map(model => model.visits), [1, 1]);
   assert.deepEqual(snapshot.models.map(model => model.tools.total), [2, 2]);
   assert.equal(new Set(snapshot.models.map(model => model.model.fingerprint)).size, 2);
-  assertPrivateContentExcluded(JSON.stringify(snapshot), current.context.workflow.settings.projectPath);
+  assertPrivateContentExcluded(JSON.stringify(snapshot), projectPath);
 });
