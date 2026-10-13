@@ -1,16 +1,22 @@
 import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { aborted } from './engine';
 
-const ignoredDirectories = new Set(['.git', '.crawlspace', 'node_modules', '.next', '.venv', 'venv', 'dist', 'build', 'coverage']);
+const ignoredDirectories = new Set(['.git', '.crawlspace', '.codex', '.aws', '.ssh', 'node_modules', '.next', '.venv', 'venv', 'dist', 'build', 'coverage']);
 function secretName(name: string): boolean {
   return /^\.env(?:\.|$)/i.test(name) || /\.(?:pem|key|p12|pfx|keystore)$/i.test(name)
     || /^(?:id_rsa|id_ed25519|credentials|secrets?\.json|\.npmrc|\.netrc)$/i.test(name);
 }
 
+export function isExcludedProjectPath(relative: string): boolean {
+  return relative.split(/[\\/]/).some(part => ignoredDirectories.has(part.toLowerCase()) || secretName(part));
+}
+
 /** Every lookup resolves symlinks before deciding whether it is within the root. */
 export class ProjectReader {
   private observedFiles = new Set<string>();
+  private observedHashes = new Map<string, string>();
   private constructor(readonly root: string) {}
 
   static async open(directory: string): Promise<ProjectReader> {
@@ -26,8 +32,7 @@ export class ProjectReader {
     const candidate = await realpath(path.resolve(this.root, input || '.'));
     const relative = path.relative(this.root, candidate);
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('Access outside the selected project folder is blocked.');
-    const parts = relative.split(path.sep);
-    if (parts.some(part => ignoredDirectories.has(part.toLowerCase()) || secretName(part))) throw new Error('Generated folders, credentials, and secret files are excluded from agent access.');
+    if (isExcludedProjectPath(relative)) throw new Error('Generated folders, credentials, and secret files are excluded from agent access.');
     const info = await stat(candidate);
     if (directory ? !info.isDirectory() : !info.isFile()) throw new Error(directory ? 'Path must point to a directory.' : 'Path must point to a file.');
     return candidate;
@@ -35,18 +40,21 @@ export class ProjectReader {
 
   async read(input: string, offset = 1, limit = 300, signal?: AbortSignal): Promise<string> {
     if (signal) aborted(signal);
+    if (!Number.isInteger(offset) || offset < 1 || !Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error('Offset starts at 1 and limit must be 1–500 lines.');
     const candidate = await this.resolve(input);
     if ((await stat(candidate)).size > 512 * 1024) throw new Error('File exceeds the 512 KiB agent read limit.');
     const buffer = await readFile(candidate);
     if (buffer.includes(0)) throw new Error('Binary files cannot be read as source text.');
     this.observedFiles.add(candidate);
-    if (!Number.isInteger(offset) || offset < 1 || !Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error('Offset starts at 1 and limit must be 1–500 lines.');
+    this.observedHashes.set(candidate, createHash('sha256').update(buffer).digest('hex'));
     const lines = buffer.toString('utf8').split('\n');
     return lines.slice(offset - 1, offset - 1 + limit).map((line, index) => `${offset + index}: ${line}`).join('\n').slice(0, 40_000)
       + `\n[${path.relative(this.root, candidate).replaceAll('\\', '/')} · ${lines.length} lines total]`;
   }
 
   hasObserved(resolvedPath: string): boolean { return this.observedFiles.has(resolvedPath); }
+
+  observedHash(resolvedPath: string): string | undefined { return this.observedHashes.get(resolvedPath); }
 
   async lineCount(input: string): Promise<number> {
     const candidate = await this.resolve(input);
@@ -107,7 +115,10 @@ export class ProjectReader {
           if (lines[index].includes(query)) matches.push(`${file}:${index + 1}: ${lines[index].slice(0, 300)}`);
           if (matches.length >= 100) break;
         }
-        if (matches.length > countBefore) this.observedFiles.add(candidate);
+        if (matches.length > countBefore) {
+          this.observedFiles.add(candidate);
+          this.observedHashes.set(candidate, createHash('sha256').update(buffer).digest('hex'));
+        }
       } catch (error) {
         if (signal?.aborted) throw error;
         // Ignore files removed or made inaccessible during a crawl.

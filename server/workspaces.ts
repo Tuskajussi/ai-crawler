@@ -27,6 +27,14 @@ export interface WorkspaceOptions {
   knowledgeOptions?: Parameters<typeof KnowledgeService.open>[1];
 }
 
+/** Waiting for approval must retain the evidence being shown to the user. */
+export function retainedScreenshotReferences(state: AppState, pending: string[] = []): string[] {
+  const findings = state.findings.flatMap(finding => finding.screenshot ? [finding.screenshot] : []);
+  const approval = state.runs.filter(run => run.status === 'running' && run.approval?.status === 'pending')
+    .flatMap(run => (run.approval?.results ?? []).flatMap(result => result.findings.flatMap(finding => finding.screenshot ? [finding.screenshot] : [])));
+  return [...new Set([...findings, ...approval, ...pending])];
+}
+
 export class Workspaces {
   private readonly opened = new Map<string, Promise<Workspace>>();
   private closing = false;
@@ -63,7 +71,7 @@ export class Workspaces {
     const knowledge = await KnowledgeService.open(path.join(directory, 'knowledge'), { ...this.options.knowledgeOptions,
       embed: async (embedding, input, options) => { validateEmbeddingAccess(embedding, this.config); return embed(embedding, input, options); } });
     let pendingScreenshots: () => string[] = () => [];
-    const retainedScreenshots = () => [...store.get().findings.flatMap(finding => finding.screenshot ? [finding.screenshot] : []), ...pendingScreenshots()];
+    const retainedScreenshots = () => retainedScreenshotReferences(store.get(), pendingScreenshots());
     try { await pruneScreenshots(path.join(directory, 'screenshots'), retainedScreenshots()); }
     catch (error) { await knowledge.dispose(); throw error; }
     const pi = createPiExecutor(directory, { chatgpt, retainedScreenshots, reliability, previewOrigins: this.config.hosted ? this.config.previewOrigins : undefined });
@@ -71,7 +79,7 @@ export class Workspaces {
     const engine = new WorkflowEngine(store, { demoStepMs: this.options.demoStepMs, routingExecutor: async context => {
       validateRoutingAccess(context.workflow.settings.routing, this.config); return route(context);
     }, piExecutor: async context => {
-      const project = await validateRunAccess(context.workflow, context.models, projectsRoot, this.config);
+      const project = await validateRunAccess(context.workflow, context.models, projectsRoot, this.config, context.project);
       context.workflow.settings.projectPath = project; return pi(context);
     } });
     pendingScreenshots = () => engine.pendingScreenshots;

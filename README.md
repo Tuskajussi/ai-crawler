@@ -1,6 +1,6 @@
 # Crawlspace
 
-A private, hostable workspace for a small team of code-review agents. Build a workflow with React Flow, give each agent a persona and responsibilities (*vastuualueet*), choose its model, and let the team review a codebase in repeated passes.
+A private, hostable workspace for a small team of coding and review agents. Build a workflow with React Flow, give each agent a persona and responsibilities (*vastuualueet*), choose its model, and let the team work on a codebase in repeated passes.
 
 ## Run locally
 
@@ -28,9 +28,12 @@ Then open `http://127.0.0.1:3001`. Set `CRAWLSPACE_PORT` to change the API port;
 - Add, move, connect, duplicate, and remove agents on a React Flow canvas.
 - Browse a searchable library of premade agents with ready-to-use personas, instructions, and responsibilities.
 - Configure a persona, instructions, model, responsibilities, and screenshot capability for each node.
+- Select an existing local folder in project-wide settings, enable focused source edits, and run named test commands with actual execution records.
 - Create/edit models for Anthropic, OpenAI, Ollama, and other OpenAI-compatible endpoints. Declare whether each model accepts images.
 - Execute a single pass, a bounded loop, or a loop that continues until stopped.
 - Run independent workflow branches together with global and per-endpoint limits.
+- Check reports without a model, correct failed units within a budget, and approve the final reports at an acceptance gate.
+- Keep scoped, manually curated lessons in future agent briefs and inspect acceptance outcomes separately from tool reliability.
 - Share messages, directed assignments, findings, and a staff directory between agents.
 - Track finding severity and resolution, inspect screenshot evidence, and review run history.
 - Compare observed tool-call outcomes, retries and report repairs for each model configuration in Tool reliability.
@@ -41,13 +44,43 @@ Then open `http://127.0.0.1:3001`. Set `CRAWLSPACE_PORT` to change the API port;
 
 The default **demo** executes the graph without a model connection. All demo activity and findings are labeled; the demo does not inspect files or take screenshots.
 
+## Project settings, editing and tests
+
+Open **Project settings** under Workspace and enter the full path to an existing folder, such as `C:\git\your-app`. **Validate folder** checks it without changing access; **Save project** makes it the shared folder for all agents. Local copies can use existing folders directly. Hosted accounts continue to use their private provisioned projects folder and support read-only review.
+
+For implementation work, enable **Allow agents to edit project files** and **Allow agents to run configured tests**. Add named commands, for example **Unit tests** / `npm test`, with a timeout of 1–600 seconds. Prepare dependencies yourself before running. These commands execute trusted project code on the controller with its operating-system permissions; this is not an OS sandbox. The command environment omits provider/server secrets and injection variables, but scripts can still access files or network services available to your OS user. Do not use untrusted projects or background-service commands here.
+
+Add the **Implementation worker** preset or enable **Edit project files** and **Run configured tests** on an existing agent. Give it a specific assignment in its instructions. Project permissions and agent capabilities must both permit the action. Edits happen directly in the selected folder; gates control workflow continuation and do not undo or apply edits later. Existing files require a successful source read and a unique exact-text replacement. New files cannot overwrite existing files and require an existing parent directory. Links, stale reads, binary/invalid UTF-8 files, credentials, generated files and sources over 512 KiB are rejected. File changes remain in place after Stop or a failed gate; review them with your version-control tools.
+
+To require verification, add a report check with **Require passing tests** after a test-enabled agent, then connect it to an acceptance gate. Every configured command must have an actual passing receipt after the last agent edit, including edits by another worker. A later edit invalidates older receipts and requires retesting. Failed tests can return that unit for bounded correction. Provider-supplied claims never populate execution evidence. Run history and approval panels show actual file changes, exit status and bounded output; completed activities are also recorded in Team messages if a visit later fails or is stopped.
+
+Workflows containing editing or test agents run visits sequentially to keep the shared folder consistent. Read-only workflows retain parallel workers. Within one controller, a mutating run holds an exclusive canonical-folder lease across accounts until its work drains; readers can share a folder only while no writer is active. Separate controller processes are not coordinated. Each visit allows up to 20 configured test invocations within the existing 40-tool-call and model-visit time limits. Timeout and Stop terminate the test process tree and wait for cleanup. Tests themselves can change the project; their scripts remain responsible for their own intended side effects.
+
 ## Premade node library
 
 Choose **Add agent** in the builder to open the **Node library**. Search or filter by discovery, review, visual work, or coordination, then preview an agent's instructions and choose its model before adding it. The library covers tasks such as codebase exploration, bug hunting, test review, security review, UI inspection, triage, and stronger-model review. Every added node is fully editable in the inspector.
 
 Presets favor enabled local models. The **Senior reviewer** prefers the configured supervisor when available, and screenshot presets only offer enabled models declared to support images. Model suggestions use your saved configuration; they do not test a connection or call a provider. Add or enable a suitable model in **Models** if a preset has no available model.
 
-Connect the new agent to the entry agent's graph, then save. Templates use the existing read-only review tools: test reviewers inspect tests without running them. Decision routing and parallel execution remain configurable in **Workflow settings**. A stronger-model review node runs on every visit; optional supervisor escalation still uses the workflow's separate limits.
+Connect the new agent to the entry agent's graph, then save. Review presets remain read-only, including test reviewers; the **Implementation worker** uses explicitly enabled editing and configured test tools. Decision routing and parallel execution remain configurable in **Workflow settings**. A stronger-model review node runs on every visit; optional supervisor escalation still uses the workflow's separate limits.
+
+## Checks, acceptance gates and lessons
+
+Select an agent at the end of a branch and choose **Add acceptance gate**. This adds a report check and a gate, or connects the new check to an existing human approval gate. You can also add either node from **Checks & gates** in the node library. Checks and gates use ordinary code and make no model requests.
+
+The path is **agent reports -> report checks -> acceptance gate -> downstream work**. Configure checks to require text output, source locations or screenshots for findings, or a complete comparison judgment. Optional severity blocks stop acceptance when the report contains a selected severity. These checks establish the selected report requirements; they do not prove every claim is correct. Demo findings cannot satisfy real evidence checks.
+
+A gate returns only reports with missing requirements to their own workers, with the reason, prior output and original assignment. Accepted siblings keep their results and independent contexts. Configure **0 to 3 corrections**; the initial attempt is separate. A severity block stops the path without asking the reviewer to rewrite away a legitimate issue. Provider retries, report-format repairs and supervisor visits retain their existing separate budgets; each correction is another bounded worker visit.
+
+Choose automatic acceptance for contained work, or **Ask me after checks pass**. High-impact gates require human approval. The builder and **Runs** show the final reports and check evidence with **Approve work** / **Reject work** actions. Approval releases only the configured downstream graph; it does not deploy, edit files, run tests or override failed checks. One human approval gate is supported per workflow; combine final branches there. Automatic gates can be used at earlier stages. Approval repeats each cycle. Stop and restart close pending approvals; a stopped run needs a new traversal.
+
+To prevent stale downstream results, a checked agent must send its normal outputs only to checks belonging to the same gate. Checks each connect to one gate. Put dependent work after that gate. Workflows containing checks or gates must have no same-cycle cycles; use explicit **Next cycle** connections for feedback. Existing workflows containing only agents keep their previous behavior.
+
+**Runs** records each checked unit's model, attempt, pass/fail reasons and the gate's final verdict. The latest 500 unit outcomes and 200 node outputs are retained per run; pending approval keeps a separate snapshot of the final reports and check evidence. Tool reliability continues to track actual tool execution separately. Neither dashboard is a controlled quality benchmark, and corrections do not automatically change JEV routing.
+
+Screenshot evidence is protected while checked reports wait for sibling branches and while approval is pending, even if current findings or ordinary history change. After the gate resolves, screenshots follow the existing finding and storage retention policy. Full retained storage blocks another capture rather than deleting evidence awaiting a decision.
+
+In **Workflow settings -> Curated lessons**, add a proven constraint, scope it to selected agents or all agents, and disable or delete it when it no longer applies. Enabled lessons enter matching Pi assignment briefs, including corrections and supervisor review. Failures never become permanent instructions automatically. Up to 100 lessons of 2,000 characters are supported; their text consumes the selected model's context allowance.
 
 ## Searchable knowledge
 
@@ -71,7 +104,7 @@ Every person running their own local copy can add their own models; each local o
 
 1. Open **Models**, select your provider and its exact model ID, and set the endpoint when using Ollama or a compatible server. Endpoints usually include `/v1`.
 2. If your provider requires a key, enter an operator-approved **environment variable name**, and set its value in the shell before starting the server. Restart the server after changing its environment. Credentials are not entered in the browser or saved in workflow JSON. Compatible endpoints can run without authentication whether hosted locally or in the cloud.
-3. Open **Workflow settings**, provision a checkout inside the displayed private projects folder and enter its absolute path, and choose **Pi harness — real agents**.
+3. Open **Project settings**, select and save an existing local codebase folder. Hosted accounts require a checkout inside their private projects folder. Then choose **Pi harness — real agents** in **Workflow settings**.
 4. Select the model in each agent's configuration. For UI agents, start the target app, set its local preview URL, and select an image-capable model.
 5. Check the Pi and model setup status in **Models**, then save and choose **Test connection** on the saved model. This explicitly sends a small streaming request and verifies a native tool/result round-trip plus JSON. Configuration readiness alone does not contact the provider. Image input and Code Mode still need checking in a real workflow.
 
@@ -134,21 +167,21 @@ Open **Run history** and expand the cycle and judge result to see the full answe
 
 ## Execution semantics
 
-All agents must be connected to the entry agent before saving. Each reachable agent executes once per cycle. **Maximum parallel agents** defaults to 1; higher limits schedule independent branches together. A join waits until every incoming branch has durably saved its report, even with a single worker. A straight chain remains sequential. The builder marks connections back to ancestors as next-cycle feedback.
+All agents must be connected to the entry agent before saving. Each reachable agent starts once per cycle; gates can request bounded corrections. **Maximum parallel agents** defaults to 1; higher limits schedule independent read-only branches together. Workflows using editing or tests serialize their visits. A join waits until every incoming branch has durably saved its report, even with a single worker. A straight chain remains sequential. The builder marks connections back to ancestors as next-cycle feedback.
 
 Connections marked as loops (`data.loop: true`) and connections returning to the entry agent are treated as feedback for the next cycle and do not add dependencies within the current cycle. Any remaining directed cycle is grouped into a component whose agents run sequentially in traversal order; its outgoing branches wait for that entire component. The next workflow cycle waits for all branches, then starts after the configured pause. Single-pass mode finishes after one visit to each agent.
 
 Each ready group receives snapshots of committed messages, findings, and current-cycle direct predecessor outputs before any sibling starts or waits for endpoint capacity. This keeps comparison candidates independent, including when they share one endpoint. Descendants and judges receive their completed prerequisites' outputs. Legacy cycle components snapshot each sequential member after the previous member commits. Each Pi attempt has an isolated session, runtime configuration, authentication store and catalog directory, so concurrent visits do not rewrite shared SDK files. The session receives its persona, prompt, responsibilities and staff directory. It can consult `list_staff`, inspect files, and capture a local UI when enabled. A validated JSON report adds findings and assignments to shared state. Assignments supply context; they do not change execution order or bypass graph connections.
 
-Real agents have read-only tools confined to the selected project. Canonical paths reject traversal and outside-project symlinks; credential files, generated directories, large files, and binary files are excluded. Code findings must cite inspected files. Agents inspect tests but do not execute test commands or edit code. Built-in Pi shell/edit tools, repository instructions, other extensions, and skills are disabled for these sessions.
+Read and edit tools are confined to the selected project. Canonical paths reject traversal and outside-project symlinks; credential files, generated directories, large files, and binary files are excluded. Code findings must cite inspected files. Editing and configured test execution require explicit project and agent permissions. Built-in Pi shell/edit tools, repository instructions, other extensions, and skills remain disabled; custom project tools implement the enabled capabilities. Configured tests run trusted code with normal OS permissions, as described above.
 
-Code Mode receives only the tools allowed for the current agent visit. Screenshot tools are available only to agents with that capability enabled. It does not add shell commands, file edits, or access beyond the supplied tools. Its temporary store belongs to one agent visit and is discarded when that visit ends. A workflow cycle creates new visits and fresh stores; findings, messages, and assignments continue to pass between agents through the workspace's shared state.
+Code Mode receives only the tools allowed for the current agent visit, including custom editing and configured-test tools when enabled. It does not add arbitrary shell commands or access beyond those tools. Its temporary store belongs to one agent visit and is discarded when that visit ends. A workflow cycle creates new visits and fresh stores; findings, messages, and assignments continue to pass between agents through the workspace's shared state.
 
-Each agent visit has a configurable deadline and a 40-tool-call limit shared across Code Mode, nested calls and retries. The deadline starts when the executor begins, including startup and retries; waiting for workflow or endpoint capacity is outside that timer and remains cancellable. Endpoint slots bound whole visits through their cleanup, rather than individual HTTP requests. Temporary provider/network failures have at most three read-only attempts with cancellation-aware backoff; long server-requested waits fail clearly. An invalid report gets at most one repair across the visit. Remaining failures use the explicitly configured supervisor when eligible, or fail visibly in history. A terminal branch failure cancels queued work and drains running siblings before ending the run. Stop also drains every active visit before another run or model edit can begin. A server restart marks interrupted runs stopped; automatic restart/resume is not implemented.
+Each agent visit has a configurable deadline and a 40-tool-call limit shared across Code Mode, nested calls and retries. The deadline starts when the executor begins, including startup and retries; waiting for workflow or endpoint capacity is outside that timer and remains cancellable. Endpoint slots bound whole visits through their cleanup, rather than individual HTTP requests. Temporary provider/network failures have at most three attempts with cancellation-aware backoff; long server-requested waits fail clearly. Edit/test receipts stay shared within the visit, and retries do not revert changes. An invalid report gets at most one repair across the visit. Remaining failures use the explicitly configured supervisor when eligible, or fail visibly in history. A terminal branch failure cancels queued work and drains running siblings before ending the run. Stop also drains every active visit before another run or model edit can begin. A server restart marks interrupted runs stopped; automatic restart/resume is not implemented.
 
 Screenshots use Playwright at a 1440×1000 viewport. Preview URLs must use an explicit loopback host (`localhost`, `127.0.0.1`, or `[::1]`); requests to other origins, service workers, and WebSockets are blocked. This can leave externally hosted assets or live data absent from a screenshot. The target application must already be running.
 
-Accounts and hashed sessions live in `.crawlspace/auth.json`. Each account has `.crawlspace/users/<user-id>/state.json`, `projects/`, `screenshots/`, and temporary `pi/` session files (cleaned after each visit). `CRAWLSPACE_DATA_DIR` changes this root. The first registered account receives a copy of legacy workflow state, screenshots, knowledge and reliability data, with existing ChatGPT connections associated with that account; later accounts start fresh. Legacy data is preserved. An old absolute project path must be updated to a checkout inside that account's projects folder.
+Accounts and hashed sessions live in `.crawlspace/auth.json`. Each account has `.crawlspace/users/<user-id>/state.json`, `projects/`, `screenshots/`, and temporary `pi/` session files (cleaned after each visit). `CRAWLSPACE_DATA_DIR` changes this root. The first registered account receives a copy of legacy workflow state, screenshots, knowledge and reliability data, with existing ChatGPT connections associated with that account; later accounts start fresh. Legacy data is preserved. Save **Project settings** to select an existing local folder; without shared project settings, the legacy workflow path stays confined to the private projects folder.
 
 Registration is closed if `CRAWLSPACE_REGISTRATION_SECRET` is empty. Rotate or clear it and restart to change future invitations; existing logins continue. Accounts use salted scrypt passwords, opaque HttpOnly/SameSite cookies, CSRF checks, authentication rate limits, and exact public Host/Origin checks. HTTPS public deployments set Secure cookies. Password changes invalidate every session for that account; there is no email recovery or administrator password-reset UI yet. Back up the data directory and protect the server environment file.
 
@@ -164,6 +197,8 @@ npm test
 npm run test:ui
 npm run test:auth
 npm run test:ux
+npm run test:gates
+npm run test:project-ui
 npm run test:pi
 npm run test:subscription
 npm run test:parallel

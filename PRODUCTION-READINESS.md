@@ -40,6 +40,28 @@ Validation passed: **265/265 backend tests with no skips**, typecheck, productio
 
 These checks use loopback or mock inference and isolated test accounts. The real machines, real model quality, subscription eligibility, public hosting and sustained-use release gates in this document remain unverified.
 
+## Acceptance workflow follow-up, 12 October 2026
+
+Model-free report checks and acceptance gates now supplement the existing agent graph. Checks validate configured output, finding evidence, comparison judgment and severity requirements. Gates preserve accepted workers, return only missing requirements for at most three corrections, and hold downstream work until acceptance. Severity blocks are terminal; rewriting a report is not a way to resolve a reported issue. Corrections retain the worker's original independent context and share existing endpoint, routing and supervisor limits.
+
+High-impact gates require human approval. Approval requests identify the exact run, gate, cycle and request timestamp, preventing an old browser view from approving a later cycle. Final worker reports and check evidence are snapshotted independently of the 200-result history limit. Checked-report screenshot leases protect evidence while sibling branches finish, and pending approval snapshots remain protected against pruning. Stop and restart close pending approvals without releasing downstream work. Authentication, account isolation and CSRF apply to approval mutations.
+
+Runs retain up to 500 unit outcomes separately from tool-call telemetry. Curated lessons are manually managed, scoped to existing agents and included only when enabled in matching Pi briefs. No failure automatically becomes a persistent instruction. Existing all-agent workflows keep their previous scheduling behavior; acceptance workflows require explicit feedback edges and exclusive correction ownership so downstream results cannot become stale.
+
+Validation: the full backend suite passed **299/299 cases with no skips**, followed by the final targeted pre-approval screenshot lease regression. The production build, existing workflow and UX browser checks, new gate browser smoke, actual Pi/Code Mode smoke (including scoped lessons and correction briefs), and compiled-server startup/restart checks passed. A large-run regression produces 251 results and verifies the frozen approval bundle preserves all 64 final worker/check reports after ordinary history trims to 200. The frontend bundle advisory remains (about 635 kB minified, 193 kB compressed).
+
+These are report acceptance controls for the existing read-only tools. They do not execute tests, edit projects, deploy changes, certify model judgments or implement dynamic graph planning. One human gate per workflow is supported, with automatic gates available at earlier stages. Actual model quality, hardware commissioning and sustained unattended operation remain unverified.
+
+## Local project implementation follow-up, 13 October 2026
+
+Project settings are now saved separately from workflow configuration and supply every agent's folder and preview URL. An explicit local selection can use an existing folder outside the private account directory. Canonical validation rejects filesystem roots, Crawlspace's account/configuration data and reserved project roots; hosted accounts retain their private project confinement and read-only execution. Selection and permission changes require an idle workspace and authenticated CSRF-protected requests.
+
+Local agents can opt into focused file editing and named test execution after the matching project permissions are enabled. Existing-file edits require a successful read, an unchanged observed hash and a unique exact-text match. File creation commits without overwriting an existing destination. Traversal, links/hard links, secret/generated paths, invalid UTF-8 and oversized sources are blocked. Code Mode exposes the same enabled custom tools; built-in arbitrary shell/edit tools remain disabled. Test subprocesses receive a limited environment, bounded/redacted output, timeouts and process-tree cancellation. Configured commands run trusted project code with the OS user's permissions; this is not an OS sandbox and hosted command execution is disabled.
+
+Mutating workflows serialize visits, and a controller-wide canonical-folder lease prevents another account's reader or writer overlapping them. Read-only workflows retain parallel scheduling. Actual command receipts and changes enter run/approval evidence; completed activities remain in messages if a visit subsequently fails or stops. A passing-test gate requires every configured command after the latest agent edit, including edits from another worker. Provider-supplied test metadata is ignored. Edits take effect directly; stopping or rejecting a gate does not roll them back. External edits outside Crawlspace and separate controller processes are not coordinated by the in-process revision/lease mechanism.
+
+Validation passed: **338/338 backend tests with no skips**, including real Windows subprocess exit/timeout/Stop/descendant cleanup and installed Pi direct/Code Mode edit/create/test flows. Project browser checks verify folder selection, permission persistence, command setup, implementation preset, execution evidence and 320/390-pixel layouts. Existing workflow and UX browser checks passed. The production build passed with the existing bundle-size advisory; real OpenAI/local model behavior with the new tools still needs user commissioning.
+
 ## Implementation follow-up
 
 | Original gap | Current outcome | Remaining deployment check |

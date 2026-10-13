@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode, RoutingAnswer, RoutingDecision, RoutingChoice, NodeResult, ReportFinding } from '../shared/types';
+import path from 'node:path';
+import { realpath } from 'node:fs/promises';
+import type { AppState, Finding, Message, ModelConfig, Run, Workflow, WorkflowNode, RoutingAnswer, RoutingDecision, RoutingChoice, NodeResult, ReportFinding, ProjectSettings, ProjectChange, TestExecution } from '../shared/types';
 import { StateStore } from './store';
 import { InputError, validateModels, validateWorkflow } from './validation';
 import { isEscalatableError } from './execution-errors';
 import { setMaxListeners } from 'node:events';
 import { EndpointLimiter, planWorkflow, type VisitComponent } from './scheduler';
 import { ROUTING_QUESTION_VERSION, routingModel, validateRoutingAnswer } from './routing';
+import { evaluateCheck } from './checks';
+
+const projectRuns = new Map<string, { writer?: string; readers: Set<string> }>();
 
 export interface AgentReport {
   output?: string;
@@ -15,6 +20,8 @@ export interface AgentReport {
   assignments?: { to: string; text: string }[];
   escalation?: { reason: string };
   execution?: { modelId: string; attempts: number; requests: number; durationMs: number; inputTokens: number; outputTokens: number };
+  tests?: TestExecution[];
+  changes?: ProjectChange[];
 }
 export interface ExecutionContext {
   workflow: Workflow;
@@ -27,7 +34,10 @@ export interface ExecutionContext {
   upstreamResults: NodeResult[];
   signal: AbortSignal;
   escalation?: { reason: string; originalModelId: string; primaryOutput?: string };
+  correction?: { attempt: number; gateNodeId: string; reasons: string[]; previousOutput: string };
   onScreenshot?: (url: string) => void;
+  project?: ProjectSettings;
+  onProjectActivity?: (activity: { change?: ProjectChange; test?: TestExecution }) => Promise<void>;
 }
 export type AgentExecutor = (context: ExecutionContext) => Promise<AgentReport>;
 
@@ -75,6 +85,11 @@ export class WorkflowEngine {
   private pending = new Set<Promise<void>>();
   private lifecycle: Promise<void> = Promise.resolve();
   private screenshots = new Set<string>();
+  private gatedScreenshots = new Map<string, Set<string>>();
+  private runProject?: ProjectSettings;
+  private releaseProject?: () => void;
+  private projectRevision = 0;
+  private approvalWaiter: { runId: string; gateNodeId: string; cycle: number; requestedAt: string; resolve: (decision: 'approve' | 'reject') => void } | null = null;
 
   constructor(
     private store: StateStore,
@@ -82,7 +97,7 @@ export class WorkflowEngine {
   ) {}
 
   get isRunning(): boolean { return this.active !== null; }
-  get pendingScreenshots(): string[] { return [...this.screenshots]; }
+  get pendingScreenshots(): string[] { return [...new Set([...this.screenshots, ...[...this.gatedScreenshots.values()].flatMap(urls => [...urls])])]; }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.lifecycle.then(operation);
@@ -99,15 +114,49 @@ export class WorkflowEngine {
 
   start(mode?: 'demo' | 'pi'): Promise<Run> { return this.serialize(() => this.startRun(mode)); }
 
+  approve(runId: string, gateNodeId: string, decision: 'approve' | 'reject', cycle: number, requestedAt: string): Promise<void> {
+    return this.serialize(async () => {
+      const waiter = this.approvalWaiter;
+      if (!['approve', 'reject'].includes(decision)) throw new InputError('Choose approve or reject.');
+      if (!waiter || waiter.runId !== runId || waiter.gateNodeId !== gateNodeId || waiter.cycle !== cycle || waiter.requestedAt !== requestedAt
+        || this.active?.id !== runId || this.active.stopping || this.active.controller.signal.aborted) {
+        throw new InputError('This gate is no longer waiting for your approval.', 409);
+      }
+      await this.store.update(state => {
+        const approval = state.runs.find(run => run.id === runId)?.approval;
+        if (this.active?.id !== runId || this.active.stopping || this.active.controller.signal.aborted
+          || !approval || approval.status !== 'pending' || approval.gateNodeId !== gateNodeId || approval.cycle !== cycle || approval.requestedAt !== requestedAt) {
+          throw new InputError('This gate is no longer waiting for your approval.', 409);
+        }
+        approval.status = decision === 'approve' ? 'approved' : 'rejected';
+        approval.resolvedAt = new Date().toISOString();
+        this.message(state, runId, 'you', gateNodeId, decision === 'approve' ? 'Gate approved. Continue with the accepted reports.' : 'Gate rejected. The run will stop before downstream work.');
+      });
+      waiter.resolve(decision);
+    });
+  }
+
   private async startRun(mode?: 'demo' | 'pi'): Promise<Run> {
     if (this.active) throw new InputError('A run is already active. Stop it before starting another.', 409);
     const state = this.store.get();
     validateModels(state.models);
     validateWorkflow(state.workflow, state.models);
+    this.runProject = state.project ? structuredClone(state.project) : undefined;
+    this.projectRevision = 0;
     const executionMode = mode ?? state.workflow.settings.executionMode;
     if (!['demo', 'pi'].includes(executionMode)) throw new InputError('Execution mode must be demo or pi.');
     const controller = new AbortController();
     const run: Run = { id: randomUUID(), status: 'running', mode: executionMode, startedAt: new Date().toISOString(), cycle: 0, steps: 0, escalations: 0, activeNodeIds: [], results: [] };
+    if (executionMode === 'pi' && this.runProject) {
+      const resolved = await realpath(this.runProject.path);
+      const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+      const mutating = state.workflow.nodes.some(node => node.type === 'agent' && (node.data.tools.includes('edit') || node.data.tools.includes('test')));
+      const leases = projectRuns.get(key) ?? { readers: new Set<string>() };
+      if (leases.writer || mutating && leases.readers.size) throw new InputError('Another workflow is using this project. Stop it before starting editing or tests in the same folder.', 409);
+      if (mutating) leases.writer = run.id; else leases.readers.add(run.id);
+      projectRuns.set(key, leases);
+      this.releaseProject = () => { if (leases.writer === run.id) delete leases.writer; leases.readers.delete(run.id); if (!leases.writer && !leases.readers.size) projectRuns.delete(key); };
+    }
     const active = { id: run.id, controller, stopping: false, task: undefined as Promise<void> | undefined };
     this.active = active;
     try {
@@ -121,9 +170,12 @@ export class WorkflowEngine {
       });
     } catch (error) {
       this.active = null;
+      this.releaseProject?.(); this.releaseProject = undefined;
       throw error;
     }
-    const task = this.execute(structuredClone(state.workflow), structuredClone(state.models), run, controller.signal);
+    const workflow = structuredClone(state.workflow);
+    if (this.runProject) { workflow.settings.projectPath = this.runProject.path; workflow.settings.previewUrl = this.runProject.previewUrl; }
+    const task = this.execute(workflow, structuredClone(state.models), run, controller.signal);
     active.task = task;
     this.pending.add(task);
     void task.then(() => this.pending.delete(task), error => {
@@ -158,10 +210,12 @@ export class WorkflowEngine {
       for (const decision of run?.decisions ?? []) if (decision.status === 'pending') {
         decision.status = 'cancelled'; decision.reason = 'The run stopped before the routing outcome could be saved.';
       }
+      if (run?.approval?.status === 'pending') { run.approval.status = 'rejected'; run.approval.resolvedAt = new Date().toISOString(); }
       state.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
       this.message(state, active.id, 'system', 'all', 'Run stopped. Pending agent work and cycle timers have been cancelled.');
     });
     if (this.active === active) this.active = null;
+    this.releaseProject?.(); this.releaseProject = undefined;
   }
 
   async waitForIdle(): Promise<void> {
@@ -175,7 +229,8 @@ export class WorkflowEngine {
   }
 
   private async execute(workflow: Workflow, models: ModelConfig[], run: Run, signal: AbortSignal): Promise<void> {
-    const workers = workflow.settings.maxParallelAgents ?? workflow.settings.maxParallel ?? 1;
+    const mutating = workflow.nodes.some(node => node.type === 'agent' && (node.data.tools.includes('edit') || node.data.tools.includes('test')));
+    const workers = mutating ? 1 : workflow.settings.maxParallelAgents ?? workflow.settings.maxParallel ?? 1;
     const routing = workflow.settings.routing;
     const limiter = new EndpointLimiter([...models, ...(routing && routing.mode !== 'off' ? [routingModel(routing)] : [])], workers);
     const plan = planWorkflow(workflow);
@@ -191,10 +246,11 @@ export class WorkflowEngine {
           current.cycle = cycle;
           delete current.activeNodeId;
           current.activeNodeIds = [];
+          delete current.approval;
           state.workflow.nodes.forEach(node => { node.data.status = 'idle'; });
           this.message(state, run.id, 'system', 'all', continuous
-            ? `Cycle ${cycle} started. Continuous crawling stays active until you stop the run. Each reachable agent runs once in this cycle.`
-            : `Cycle ${cycle} of ${cycles} started. Each reachable agent runs once in this cycle.`);
+            ? `Cycle ${cycle} started. Continuous crawling stays active until you stop the run. Each reachable node starts once; acceptance gates may request bounded corrections.`
+            : `Cycle ${cycle} of ${cycles} started. Each reachable node starts once; acceptance gates may request bounded corrections.`);
         });
         await this.executeCycle(plan, workflow, models, run, cycle, limiter, signal, id => { failedNodeId = id; });
         if (continuous || cycle < cycles) {
@@ -215,7 +271,7 @@ export class WorkflowEngine {
         current.finishedAt = new Date().toISOString();
         delete current.activeNodeId;
         current.activeNodeIds = [];
-        this.message(state, run.id, 'system', 'all', `Run completed after ${cycles} cycle${cycles === 1 ? '' : 's'} and ${current.steps} agent steps.`);
+        this.message(state, run.id, 'system', 'all', `Run completed after ${cycles} cycle${cycles === 1 ? '' : 's'} and ${current.steps} workflow steps.`);
       });
     } catch (error) {
       if (!signal.aborted) {
@@ -229,6 +285,7 @@ export class WorkflowEngine {
             for (const decision of current.decisions ?? []) if (decision.status === 'pending') {
               decision.status = 'cancelled'; decision.reason = 'The run failed before the routing outcome could be saved.';
             }
+            if (current.approval?.status === 'pending') { current.approval.status = 'rejected'; current.approval.resolvedAt = new Date().toISOString(); }
             state.workflow.nodes.forEach(item => { if (item.data.status === 'running') item.data.status = 'idle'; });
             const node = state.workflow.nodes.find(item => item.id === failedNodeId);
             if (node) node.data.status = 'error';
@@ -243,6 +300,8 @@ export class WorkflowEngine {
         }
       }
     } finally {
+      this.gatedScreenshots.clear();
+      if (!this.active?.stopping) { this.releaseProject?.(); this.releaseProject = undefined; }
       if (this.active?.id === run.id && !this.active.stopping) this.active = null;
     }
   }
@@ -254,6 +313,7 @@ export class WorkflowEngine {
     setMaxListeners(256, signal);
     const completed = new Set<string>();
     const results = new Map<string, NodeResult>();
+    const visits = new Map<string, { snapshot: AppState; upstream: NodeResult[] }>();
     const launched = new Set<string>();
     const running = new Map<string, Promise<void>>();
     const allowance = { used: 0, decisions: 0 };
@@ -263,6 +323,122 @@ export class WorkflowEngine {
       failure = { error };
       failed(id);
       controller.abort();
+    };
+    const inputsFor = (id: string) => [...new Map(workflow.edges
+      .filter(edge => edge.target === id && edge.data?.loop !== true && id !== workflow.settings.entryNodeId)
+      .map(edge => results.get(edge.source)).filter((result): result is NodeResult => Boolean(result))
+      .map(result => [result.nodeId, result])).values()];
+    const checkNode = async (node: WorkflowNode): Promise<NodeResult> => {
+      aborted(signal);
+      const check = evaluateCheck(node, inputsFor(node.id), this.projectRevision);
+      const result: NodeResult = {
+        nodeId: node.id, nodeName: node.data.label, modelId: 'deterministic', cycle, findings: [], check,
+        output: check.passed ? 'All configured report checks passed. This verifies the selected criteria, not overall correctness.'
+          : check.units.map(unit => `${unit.nodeId}: ${unit.reasons.join('; ') || 'passed'}`).join('\n').slice(0, 30_000),
+        completedAt: new Date().toISOString(), projectRevision: this.projectRevision,
+      };
+      await this.commitControlResult(run.id, result, signal);
+      results.set(node.id, result);
+      return result;
+    };
+    const gateNode = async (node: WorkflowNode): Promise<NodeResult> => {
+      const settings = node.data.gate!;
+      const checkNodes = inputsFor(node.id).map(result => workflow.nodes.find(item => item.id === result.nodeId)!);
+      await this.store.update(state => { aborted(signal); this.setNodeActive(state, run.id, node.id, true); });
+      let corrections = 0;
+      let changed: Set<string> | undefined;
+      let approvedByHuman = false;
+      const finish = async (verdict: 'accepted' | 'rejected', reason?: string): Promise<NodeResult> => {
+        const reports = [...new Set(checkNodes.flatMap(check => inputsFor(check.id).map(result => result.nodeId)))].map(id => results.get(id)!);
+        const perReport = Math.max(100, Math.floor(24_000 / Math.max(1, reports.length)));
+        const output = verdict === 'accepted'
+          ? `Gate accepted ${reports.length} report(s) after ${corrections} correction round(s). ${run.mode === 'demo' ? 'SIMULATED DEMO; no real work was verified. ' : ''}Only the configured checks were verified.\n\nFinal accepted reports (bounded summaries):\n${reports.map(report => `${report.nodeName} [${report.nodeId}], model ${report.modelId}, attempt ${report.attempt ?? 1}:\n${report.output.slice(0, perReport)}${report.output.length > perReport ? '\n[Report shortened; see run history for the full output.]' : ''}`).join('\n\n')}`.slice(0, 30_000)
+          : `Gate rejected: ${reason ?? 'The configured checks did not pass.'}`.slice(0, 30_000);
+        const result: NodeResult = {
+          nodeId: node.id, nodeName: node.data.label, modelId: 'deterministic', cycle, output,
+          findings: verdict === 'accepted' ? reports.flatMap(report => report.findings).slice(0, 30) : [],
+          gate: { verdict, checkNodeIds: checkNodes.map(check => check.id), corrections, risk: settings.risk, ...(approvedByHuman ? { approvedByHuman: true } : {}) },
+          completedAt: new Date().toISOString(),
+        };
+        await this.commitControlResult(run.id, result, signal);
+        await this.store.update(state => {
+          aborted(signal);
+          this.setNodeActive(state, run.id, node.id, false);
+          state.workflow.nodes.find(item => item.id === node.id)!.data.status = verdict === 'accepted' ? 'done' : 'error';
+          this.message(state, run.id, node.id, 'all', output.slice(0, 2000));
+        });
+        results.set(node.id, result);
+        for (const report of reports) this.gatedScreenshots.delete(report.nodeId);
+        return result;
+      };
+      while (true) {
+        aborted(signal);
+        // A later worker edit invalidates earlier test receipts even when that
+        // worker's report already passed its first check.
+        for (const check of checkNodes) if (check.data.check?.requireTests && results.get(check.id)?.projectRevision !== this.projectRevision) await checkNode(check);
+        const units = new Map<string, { reasons: string[]; retryable: boolean }>();
+        for (const check of checkNodes) {
+          const outcome = results.get(check.id)?.check;
+          if (!outcome || !outcome.units.length) throw new Error(`${node.data.label} has no check evidence. No approval is permitted.`);
+          for (const unit of outcome.units) {
+            const combined = units.get(unit.nodeId) ?? { reasons: [], retryable: true };
+            combined.reasons = [...new Set([...combined.reasons, ...unit.reasons])].slice(0, 30);
+            if (!unit.passed) combined.retryable &&= unit.retryable;
+            units.set(unit.nodeId, combined);
+          }
+        }
+        await this.store.update(state => {
+          aborted(signal);
+          const current = state.runs.find(item => item.id === run.id)!;
+          for (const [id, unit] of units) {
+            if (changed && !changed.has(id) && !unit.reasons.length) continue;
+            const report = results.get(id)!;
+            (current.outcomes ??= []).push({ id: randomUUID(), nodeId: id, gateNodeId: node.id, cycle,
+              attempt: report.attempt ?? 1, verdict: unit.reasons.length ? 'rejected' : 'accepted', reasons: unit.reasons,
+              modelId: report.modelId, createdAt: new Date().toISOString() });
+          }
+          current.outcomes = current.outcomes?.slice(-500);
+        });
+        const rejected = [...units].filter(([, unit]) => unit.reasons.length);
+        if (!rejected.length) {
+          if (settings.approval === 'human' || settings.risk === 'high-impact') {
+            const approvalResults = [...new Map(checkNodes.flatMap(check => [...inputsFor(check.id), results.get(check.id)!]).map(result => [result.nodeId, result])).values()];
+            const decision = await this.requestApproval(run, node, cycle, signal, approvalResults);
+            if (decision === 'reject') { await finish('rejected', 'You rejected the final reports.'); throw new Error(`${node.data.label}: final approval rejected.`); }
+            approvedByHuman = true;
+          }
+          return finish('accepted');
+        }
+        const reason = rejected.map(([id, unit]) => `${id}: ${unit.reasons.join('; ')}`).join('\n').slice(0, 10_000);
+        if (rejected.some(([, unit]) => !unit.retryable) || corrections >= settings.maxCorrections) {
+          await finish('rejected', reason);
+          throw new Error(`${node.data.label} blocked downstream work. ${corrections >= settings.maxCorrections ? 'Correction allowance exhausted. ' : 'A non-correctable check failed. '}${reason}`);
+        }
+        corrections++;
+        changed = new Set(rejected.map(([id]) => id));
+        await this.store.update(state => {
+          aborted(signal);
+          this.message(state, run.id, node.id, 'all', `Correction round ${corrections}/${settings.maxCorrections}: returning only ${rejected.map(([id]) => id).join(', ')}. Accepted reports are preserved.`);
+        });
+        // Use each worker's original snapshot and inputs. A correction must not
+        // leak the private answers of accepted sibling branches into its context.
+        const corrected = await Promise.allSettled(rejected.map(async ([id, unit]) => {
+          try {
+            const original = visits.get(id);
+            const worker = workflow.nodes.find(item => item.id === id)!;
+            const previous = results.get(id)!;
+            if (!original || worker.type !== 'agent') throw new Error('A correction can only return to a worker visited in this cycle.');
+            const result = await this.executeNode(workflow, models, run, cycle, worker, limiter, allowance, signal,
+              error => fail(node.id, error), original.snapshot, original.upstream,
+              { attempt: (previous.attempt ?? 1) + 1, gateNodeId: node.id, reasons: unit.reasons, previousOutput: previous.output });
+            results.set(id, result);
+          } catch (error) { fail(node.id, error); throw error; }
+        }));
+        const correctionFailure = corrected.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (correctionFailure) throw correctionFailure.reason;
+        // Re-evaluate checks using the final report map, never stale run history.
+        for (const check of checkNodes) if (inputsFor(check.id).some(report => changed!.has(report.nodeId))) await checkNode(check);
+      }
     };
     try {
       while (completed.size < plan.length) {
@@ -278,10 +454,13 @@ export class WorkflowEngine {
             for (const [index, id] of component.nodeIds.entries()) {
               aborted(signal);
               try {
-                const inputs = workflow.edges.filter(edge => edge.target === id && edge.data?.loop !== true && id !== workflow.settings.entryNodeId)
-                  .map(edge => results.get(edge.source)).filter((result): result is NodeResult => Boolean(result));
-                const upstream = [...new Map(inputs.map(result => [result.nodeId, result])).values()];
-                const result = await this.executeNode(workflow, models, run, cycle, workflow.nodes.find(node => node.id === id)!, limiter, allowance, signal, error => fail(id, error), index ? this.store.get() : snapshot, upstream);
+                const upstream = inputsFor(id);
+                const node = workflow.nodes.find(node => node.id === id)!;
+                const visitSnapshot = index ? this.store.get() : snapshot;
+                if (node.type === 'agent') visits.set(id, { snapshot: visitSnapshot, upstream });
+                const result = node.type === 'check' ? await checkNode(node)
+                  : node.type === 'gate' ? await gateNode(node)
+                  : await this.executeNode(workflow, models, run, cycle, node, limiter, allowance, signal, error => fail(id, error), visitSnapshot, upstream);
                 results.set(id, result);
               } catch (error) { fail(id, error); throw error; }
             }
@@ -310,6 +489,41 @@ export class WorkflowEngine {
     const node = state.workflow.nodes.find(item => item.id === nodeId)!;
     if (active) node.data.status = 'running';
     else if (node.data.status === 'running') node.data.status = 'idle';
+  }
+
+  private async commitControlResult(runId: string, result: NodeResult, signal: AbortSignal): Promise<void> {
+    await this.store.update(state => {
+      aborted(signal);
+      const current = state.runs.find(item => item.id === runId)!;
+      current.steps++;
+      (current.results ??= []).push(result);
+      current.results = current.results.slice(-200);
+      state.workflow.nodes.find(node => node.id === result.nodeId)!.data.status = 'done';
+    });
+  }
+
+  private async requestApproval(run: Run, node: WorkflowNode, cycle: number, signal: AbortSignal, results: NodeResult[]): Promise<'approve' | 'reject'> {
+    aborted(signal);
+    if (this.approvalWaiter) throw new Error('Another gate is already waiting for approval.');
+    let resolve!: (decision: 'approve' | 'reject') => void;
+    const decision = new Promise<'approve' | 'reject'>(done => { resolve = done; });
+    const requestedAt = new Date().toISOString();
+    const waiter = { runId: run.id, gateNodeId: node.id, cycle, requestedAt, resolve };
+    this.approvalWaiter = waiter;
+    try {
+      await this.store.update(state => {
+        aborted(signal);
+        state.runs.find(item => item.id === run.id)!.approval = { gateNodeId: node.id, cycle, status: 'pending', requestedAt, results: structuredClone(results) };
+        this.message(state, run.id, node.id, 'all', `${node.data.label}: configured checks passed. Review the reports and approve or reject this gate in Runs. Downstream work is waiting.`);
+      });
+      aborted(signal);
+      return await new Promise<'approve' | 'reject'>((done, reject) => {
+        const cancel = () => { signal.removeEventListener('abort', cancel); reject(new DOMException('Run stopped.', 'AbortError')); };
+        signal.addEventListener('abort', cancel, { once: true });
+        void decision.then(value => { signal.removeEventListener('abort', cancel); done(value); });
+        if (signal.aborted) cancel();
+      });
+    } finally { if (this.approvalWaiter === waiter) this.approvalWaiter = null; }
   }
 
   private async routeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { decisions: number }, signal: AbortSignal, fail: (error: unknown) => void, snapshot: AppState, upstreamResults: NodeResult[]): Promise<{ choice: 'assigned' | 'supervisor'; reason?: string }> {
@@ -392,15 +606,16 @@ export class WorkflowEngine {
     return { choice: settings.mode === 'active' && (recommendation as RoutingChoice) === 'supervisor' ? 'supervisor' : 'assigned', reason };
   }
 
-  private async executeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { used: number; decisions: number }, signal: AbortSignal, fail: (error: unknown) => void, snapshot: AppState, upstreamResults: NodeResult[]): Promise<NodeResult> {
+  private async executeNode(workflow: Workflow, models: ModelConfig[], run: Run, cycle: number, node: WorkflowNode, limiter: EndpointLimiter, allowance: { used: number; decisions: number }, signal: AbortSignal, fail: (error: unknown) => void, snapshot: AppState, upstreamResults: NodeResult[], correction?: ExecutionContext['correction']): Promise<NodeResult> {
     const captures = new Set<string>();
+    const testRevisions = new Map<string, number>();
     const visit = async (visitNode: WorkflowNode, escalation?: ExecutionContext['escalation']): Promise<AgentReport> => {
       const model = models.find(item => item.id === visitNode.data.modelId && item.enabled)!;
       return limiter.run(model, signal, async () => {
         try {
           await this.store.update(state => { aborted(signal); this.setNodeActive(state, run.id, node.id, true); });
           const state = structuredClone(snapshot);
-          if (escalation) {
+          if (escalation || correction) {
             // Carry this candidate's verified primary work into stronger review
             // while retaining its independent snapshot of the other branches.
             const latest = this.store.get();
@@ -408,7 +623,16 @@ export class WorkflowEngine {
             const seen = new Set(state.messages.map(message => message.id));
             state.messages.push(...latest.messages.filter(message => message.runId === run.id && message.from === node.id && !seen.has(message.id)));
           }
-          const context: ExecutionContext = { workflow: structuredClone(workflow), models: structuredClone(models), node: structuredClone(visitNode), run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, upstreamResults: structuredClone(upstreamResults), signal, escalation,
+          const context: ExecutionContext = { workflow: structuredClone(workflow), models: structuredClone(models), node: structuredClone(visitNode), run: state.runs.find(item => item.id === run.id)!, cycle, messages: state.messages, findings: state.findings, upstreamResults: structuredClone(upstreamResults), signal, escalation, correction: correction ? structuredClone(correction) : undefined,
+            project: this.runProject ? structuredClone(this.runProject) : undefined,
+            onProjectActivity: activity => this.store.update(current => {
+              if (activity.change) this.projectRevision++;
+              if (activity.test) testRevisions.set(activity.test.commandId, this.projectRevision);
+              // A completed physical edit remains auditable even if Stop was requested.
+              const text = activity.change ? `Project file ${activity.change.action}: ${activity.change.path}`
+                : activity.test ? `Test executed: ${activity.test.name} [${activity.test.commandId}] — ${activity.test.passed ? 'passed' : activity.test.timedOut ? 'timed out' : `failed (exit ${activity.test.exitCode ?? 'interrupted'})`}\n${activity.test.output}` : '';
+              if (text) this.message(current, run.id, node.id, 'all', text.slice(0, 20_000));
+            }).then(() => {}),
             onScreenshot: url => { captures.add(url); this.screenshots.add(url); },
           };
           if (run.mode === 'demo') { await delay(this.options.demoStepMs ?? 1100, signal); return demoReport(context); }
@@ -488,7 +712,12 @@ export class WorkflowEngine {
         : report.messages?.map(message => message.text).join('\n\n') || 'Review completed with no verified findings.').slice(0, 30_000);
       const result: NodeResult = {
         nodeId: node.id, nodeName: node.data.label, modelId: executedModelId, cycle,
-        output: report.output ?? fallbackOutput, findings: structuredClone(report.findings ?? []),
+        output: report.output ?? (workflow.edges.some(edge => edge.source === node.id && !edge.data?.loop
+          && workflow.nodes.some(item => item.id === edge.target && item.type === 'check' && item.data.check?.requireOutput)) ? '' : fallbackOutput), findings: structuredClone(report.findings ?? []),
+        attempt: correction?.attempt ?? 1,
+        ...(report.tests ? { tests: report.tests.map(test => ({ ...structuredClone(test), projectRevision: testRevisions.get(test.commandId) })) } : {}),
+        ...(report.changes ? { changes: structuredClone(report.changes) } : {}),
+        ...(node.data.tools.includes('test') && this.runProject ? { requiredTestIds: this.runProject.testCommands.map(command => command.id) } : {}),
         ...(report.judgment ? { judgment: structuredClone(report.judgment) } : {}), completedAt: new Date().toISOString(),
       };
       await this.store.update(state => {
@@ -503,6 +732,12 @@ export class WorkflowEngine {
         state.workflow.nodes.find(item => item.id === node.id)!.data.status = 'done';
         this.applyReport(state, workflow, run, node, report);
       });
+      if (workflow.edges.some(edge => edge.source === node.id && !edge.data?.loop
+        && workflow.nodes.some(item => item.id === edge.target && item.type === 'check'))) {
+        const retained = this.gatedScreenshots.get(node.id) ?? new Set<string>();
+        for (const finding of result.findings) if (finding.screenshot) retained.add(finding.screenshot);
+        this.gatedScreenshots.set(node.id, retained);
+      }
       return result;
     } finally { for (const url of captures) this.screenshots.delete(url); }
   }

@@ -13,6 +13,8 @@
     "test:ui": "tsx scripts/ui-smoke.ts",
     "test:auth": "tsx scripts/auth-smoke.ts",
     "test:ux": "tsx scripts/ux-smoke.ts",
+    "test:gates": "tsx scripts/gates-smoke.ts",
+    "test:project-ui": "tsx scripts/project-smoke.ts",
     "test:knowledge": "tsx scripts/knowledge-smoke.ts",
     "test:reliability": "tsx scripts/reliability-smoke.ts",
     "test:subscription": "tsx scripts/subscription-smoke.ts",

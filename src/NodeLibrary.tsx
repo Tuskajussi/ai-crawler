@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, Bot, Check, Cloud, Cpu, Eye, FileSearch, Layers3, Network, Plus, Search, ShieldCheck, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Bot, Check, Cloud, Code2, Cpu, Eye, FileSearch, Layers3, ListChecks, Network, Plus, Search, ShieldCheck, X } from 'lucide-react';
 import type { AgentData, ModelConfig } from '../shared/types';
 import { compatibleTemplateModels, instantiateNodeTemplate, nodeTemplateCategories, nodeTemplates, suggestedTemplateModel, type NodeTemplate } from '../shared/node-library';
 import './node-library.css';
@@ -9,6 +9,7 @@ interface NodeLibraryProps {
   supervisorModelId?: string;
   disabledReason?: string;
   onAdd: (data: AgentData) => void;
+  onAddControl: (type: 'check' | 'gate') => void;
   onClose: () => void;
   onManageModels: () => void;
 }
@@ -21,9 +22,10 @@ const categoryDescriptions = {
   coordinate: 'Organize findings, handoffs, and your own roles.',
 };
 const categoryLabel = (category: NodeTemplate['category']) => nodeTemplateCategories.find(item => item.id === category)?.label ?? category;
-const toolLabels = { read: 'Read project files', screenshot: 'Capture local UI' };
+const toolLabels = { read: 'Read project files', screenshot: 'Capture local UI', edit: 'Edit project files', test: 'Run configured tests' };
+const toolIcons = { read: FileSearch, screenshot: Eye, edit: Code2, test: ListChecks };
 
-export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, onClose, onManageModels }: NodeLibraryProps) {
+export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, onAddControl, onClose, onManageModels }: NodeLibraryProps) {
   const titleId = useId();
   const descriptionId = useId();
   const availabilityId = useId();
@@ -35,7 +37,7 @@ export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, 
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const [query, setQuery] = useState('');
-  const [category, setCategory] = useState<'all' | NodeTemplate['category']>('all');
+  const [category, setCategory] = useState<'all' | 'controls' | NodeTemplate['category']>('all');
   const [selectedId, setSelectedId] = useState<string>();
   const [modelId, setModelId] = useState('');
   const selectedTemplate = nodeTemplates.find(template => template.id === selectedId);
@@ -95,6 +97,9 @@ export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, 
     }
   }, [selectedId]);
 
+  const showControls = (category === 'all' || category === 'controls') && (!query.trim() || /check|gate|accept|requirement|code|correction|report|evidence/i.test(query));
+  const resultCount = filteredTemplates.length + (showControls ? 2 : 0);
+
   const selectTemplate = (template: NodeTemplate) => {
     if (selectedId !== template.id) {
       setSelectedId(template.id);
@@ -123,13 +128,15 @@ export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, 
           <div className="node-library-filters">
             <div className="node-library-search"><Search size={18} aria-hidden="true" /><input ref={searchRef} type="search" aria-label="Search node templates" aria-controls={templatesId} placeholder="Search roles, skills, or responsibilities..." value={query} onChange={event => { setQuery(event.target.value); clearSelection(); }} />{query && <button type="button" aria-label="Clear template search" onClick={() => { setQuery(''); clearSelection(); searchRef.current?.focus(); }}><X size={16} /></button>}</div>
             <nav className="node-library-categories" aria-label="Template categories">
-              <button type="button" aria-pressed={category === 'all'} onClick={() => { setCategory('all'); clearSelection(); }}>All templates<span aria-hidden="true">{nodeTemplates.length}</span></button>
+              <button type="button" aria-pressed={category === 'all'} onClick={() => { setCategory('all'); clearSelection(); }}>All templates<span aria-hidden="true">{nodeTemplates.length + 2}</span></button>
               {nodeTemplateCategories.map(item => <button key={item.id} type="button" aria-pressed={category === item.id} onClick={() => { setCategory(item.id); clearSelection(); }}>{item.label}<span aria-hidden="true">{nodeTemplates.filter(template => template.category === item.id).length}</span></button>)}
+              <button type="button" aria-pressed={category === 'controls'} onClick={() => { setCategory('controls'); clearSelection(); }}>Checks & gates<span aria-hidden="true">2</span></button>
             </nav>
-            <p className="node-library-result-count" aria-live="polite">{filteredTemplates.length} {filteredTemplates.length === 1 ? 'template' : 'templates'}<span>Choose one to preview</span></p>
+            <p className="node-library-result-count" aria-live="polite">{resultCount} {resultCount === 1 ? 'template' : 'templates'}<span>Choose one to preview</span></p>
           </div>
 
           <div className="node-library-templates" id={templatesId}>
+            {showControls && <section className="node-library-shelf node-library-controls" aria-labelledby={`${templatesId}-controls`}><header className="node-library-shelf-heading"><ShieldCheck size={18}/><div><h3 id={`${templatesId}-controls`}>Checks & gates<span>2</span></h3><p>Set explicit requirements and accept work with evidence.</p></div></header><div className="node-library-shelf-cards">{(['check', 'gate'] as const).map(type => <button type="button" key={type} className="node-template-card" disabled={!!disabledReason} onClick={() => onAddControl(type)} aria-label={type === 'check' ? 'Add report check' : 'Add acceptance gate node'}><span className="node-template-topline"><span className="node-template-icon category-review"><ShieldCheck size={18}/></span><span className="node-template-category">Runs with code</span><Plus size={15}/></span><strong>{type === 'check' ? 'Report check' : 'Acceptance gate'}</strong><p>{type === 'check' ? 'Validate output, evidence, judgment, and severity requirements.' : 'Retry only failed reports, then accept or ask for your approval.'}</p><span className="control-template-note"><Check size={12}/>No model needed · Configure after adding</span></button>)}</div>{disabledReason && <p className="node-library-disabled-reason">{disabledReason}</p>}</section>}
             {nodeTemplateCategories.map(item => {
               const templates = filteredTemplates.filter(template => template.category === item.id);
               if (!templates.length) return null;
@@ -148,7 +155,7 @@ export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, 
                 })}</div>
               </section>;
             })}
-            {filteredTemplates.length === 0 && <div className="node-library-empty-results"><Search size={25} /><h3>No templates match</h3><p>Try another role or responsibility.</p><button type="button" className="btn btn-secondary" onClick={() => { setQuery(''); setCategory('all'); clearSelection(); searchRef.current?.focus(); }}>Clear filters</button></div>}
+            {resultCount === 0 && <div className="node-library-empty-results"><Search size={25} /><h3>No templates match</h3><p>Try another role or responsibility.</p><button type="button" className="btn btn-secondary" onClick={() => { setQuery(''); setCategory('all'); clearSelection(); searchRef.current?.focus(); }}>Clear filters</button></div>}
           </div>
         </div>
 
@@ -170,7 +177,8 @@ export function NodeLibrary({ models, supervisorModelId, disabledReason, onAdd, 
               </div>
               {selectedTemplate.modelPreference === 'supervisor' && <p className="node-library-supervisor-note">This is a regular review node. It uses the chosen model on every visit, separately from optional supervisor escalation limits.</p>}
               <div className="node-library-preview-section"><h4>Responsibilities</h4><ul>{selectedTemplate.responsibilities.map(responsibility => <li key={responsibility}>{responsibility}</li>)}</ul></div>
-              <div className="node-library-preview-section"><h4>Tools</h4><div className="node-library-tool-list">{selectedTemplate.tools.map(tool => <span key={tool}>{tool === 'read' ? <FileSearch size={13} /> : <Eye size={13} />}{toolLabels[tool]}</span>)}</div></div>
+              <div className="node-library-preview-section"><h4>Tools</h4><div className="node-library-tool-list">{selectedTemplate.tools.map(tool => { const Icon = toolIcons[tool]; return <span key={tool}><Icon size={13}/>{toolLabels[tool]}</span>; })}</div></div>
+              {(selectedTemplate.tools.includes('edit') || selectedTemplate.tools.includes('test')) && <p className="node-library-supervisor-note">Enable editing and tests in Project settings before running this worker. It writes changes directly to the selected folder and runs your configured test commands.</p>}
               <details className="node-library-instructions"><summary>Persona and instructions</summary><h4>Persona</h4><p>{selectedTemplate.persona}</p><h4>Instructions</h4><p>{selectedTemplate.prompt}</p></details>
             </div>
             <div className="node-library-add-area">

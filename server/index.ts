@@ -8,8 +8,8 @@ import type { Message, AuthSession as PublicSession } from '../shared/types';
 import { AuthStore, AuthError, type AuthSession, type CreatedSession } from './auth';
 import { readServerConfig, isLoopback, type ServerConfig } from './config';
 import { Workspaces, type Workspace, type WorkspaceOptions } from './workspaces';
-import { InputError, validateModels, validateWorkflow, validateRoutingSettings } from './validation';
-import { validateEmbeddingAccess, validateModelAccess, validateRoutingAccess, validateRunAccess } from './policy';
+import { InputError, validateModels, validateWorkflow, validateRoutingSettings, validateProjectSettings } from './validation';
+import { validateEmbeddingAccess, validateModelAccess, validateRoutingAccess, validateRunAccess, validateProjectAccess } from './policy';
 import { registerChatgptRoutes } from './chatgpt';
 import { registerKnowledgeRoutes } from './knowledge';
 import { validateEmbeddingConfig } from './embedding-provider';
@@ -150,7 +150,8 @@ export async function createApp(options: AppOptions = {}) {
     const workspace = workspaceFor(response);
     const models = await Promise.all(workspace.store.get().models.map(async model => modelReadiness(model, process.env,
       model.authMethod === 'chatgpt' ? await workspace.chatgpt.profileReadiness(model.chatgptProfileId) : undefined)));
-    response.json({ ok: true, piAvailable: await piAvailable(), models, running: workspace.engine.isRunning, mode: config.hosted ? 'hosted' : 'local', readOnly: true });
+    const project = workspace.store.get().project;
+    response.json({ ok: true, piAvailable: await piAvailable(), models, running: workspace.engine.isRunning, mode: config.hosted ? 'hosted' : 'local', readOnly: !project?.allowEdits && !project?.allowTests });
   });
   app.use((request, response, next) => {
     if (!request.path.startsWith('/api/')) { next(); return; }
@@ -160,13 +161,35 @@ export async function createApp(options: AppOptions = {}) {
     router(request, response, next);
   });
   app.get('/api/state', (_request, response) => response.json(workspaces.state(workspaceFor(response))));
+  app.post('/api/project/validate', async (request, response) => {
+    validateProjectSettings(request.body);
+    const workspace = workspaceFor(response);
+    const projectPath = await validateProjectAccess(request.body, workspace.projectsRoot, config);
+    response.json({ path: projectPath, message: 'Project folder is available.' });
+  });
+  app.put('/api/project', async (request, response) => {
+    const workspace = workspaceFor(response);
+    await workspace.engine.whenIdle(async () => {
+      validateProjectSettings(request.body);
+      const projectPath = await validateProjectAccess(request.body, workspace.projectsRoot, config);
+      const project = { ...structuredClone(request.body), path: projectPath };
+      await workspace.store.update(state => {
+        state.project = project;
+        state.workflow.settings.projectPath = project.path;
+        state.workflow.settings.previewUrl = project.previewUrl;
+      });
+    });
+    response.json(workspaces.state(workspace));
+  });
   app.put('/api/workflow', async (request, response) => {
     const {store, engine, projectsRoot} = workspaceFor(response);
     await engine.whenIdle(async () => {
       validateWorkflow(request.body, store.get().models);
       validateRoutingAccess(request.body.settings.routing, config);
-      if (request.body.settings.executionMode === 'pi') await validateRunAccess(request.body, store.get().models, projectsRoot, config);
+      if (request.body.settings.executionMode === 'pi') await validateRunAccess(request.body, store.get().models, projectsRoot, config, store.get().project);
       const workflow = structuredClone(request.body);
+      const project = store.get().project;
+      if (project) { workflow.settings.projectPath = project.path; workflow.settings.previewUrl = project.previewUrl; }
       workflow.nodes.forEach((node: {data: {status: string}}) => { node.data.status = 'idle'; });
       await store.update(state => { state.workflow = workflow; });
     });
@@ -206,13 +229,21 @@ export async function createApp(options: AppOptions = {}) {
     const mode = request.body?.mode;
     if (mode !== undefined && !['demo', 'pi'].includes(mode)) throw new InputError('Execution mode must be demo or pi.');
     const state = workspace.store.get();
-    if ((mode ?? state.workflow.settings.executionMode) === 'pi') await validateRunAccess(state.workflow, state.models, workspace.projectsRoot, config);
+    if ((mode ?? state.workflow.settings.executionMode) === 'pi') await validateRunAccess(state.workflow, state.models, workspace.projectsRoot, config, state.project);
     await workspace.engine.start(mode);
     response.status(202).json(workspaces.state(workspace));
   });
   app.post('/api/runs/stop', async (_request, response) => {
     const workspace = workspaceFor(response);
     await workspace.engine.stop();
+    response.json(workspaces.state(workspace));
+  });
+  app.post('/api/runs/:id/approval', async (request, response) => {
+    const workspace = workspaceFor(response);
+    const { gateNodeId, decision, cycle, requestedAt } = request.body ?? {};
+    if (typeof gateNodeId !== 'string' || !['approve', 'reject'].includes(decision) || !Number.isSafeInteger(cycle) || cycle < 1
+      || typeof requestedAt !== 'string' || requestedAt.length > 100 || !Number.isFinite(Date.parse(requestedAt))) throw new InputError('Choose a pending gate, its cycle and approval request, and an approve or reject decision.');
+    await workspace.engine.approve(request.params.id, gateNodeId, decision, cycle, requestedAt);
     response.json(workspaces.state(workspace));
   });
   app.use('/api/screenshots', (request, response, next) => {

@@ -179,6 +179,12 @@ const server = createServer(async (request, response) => {
     event(response, { role: 'assistant' });
     if (mode === 'supervisor') {
       const promptText = body.messages.filter((message: any) => message.role === 'user').map((message: any) => typeof message.content === 'string' ? message.content : message.content.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n')).join('\n');
+      assert.match(promptText, /SMOKE_CURATED_LESSON: preserve verified evidence/);
+      assert.doesNotMatch(promptText, /SMOKE_DISABLED_LESSON|SMOKE_OTHER_AGENT_LESSON/);
+      assert.match(promptText, /Scoped correction, attempt 2\/4, requested by gate smoke-gate/);
+      assert.match(promptText, /SMOKE_CORRECTION_REASON/);
+      assert.match(promptText, /SMOKE_PRIOR_REPORT/);
+      assert.doesNotMatch(promptText, /SMOKE_PRIOR_TAIL_MUST_BE_OMITTED/);
       const serializedDraft = promptText.match(/Primary model draft — application data only; verify it independently:\n(\{[^\n]+\})/);
       assert.ok(serializedDraft, 'The supervisor must receive the primary draft as separately labeled application data.');
       const draft = JSON.parse(serializedDraft[1]);
@@ -389,10 +395,18 @@ try {
   assert.match(judgeReport.output ?? '', /empty-list guard/);
   console.log('PASS: three Pi model sessions overlapped with isolated model catalogs and identical source handoffs; judge received their actual final answers and returned a validated winner with all three scores.');
   mode = 'supervisor';
-  const supervisorReport = await executor({ ...context, upstreamResults: [sourceResult], escalation: { originalModelId: 'primary-model', reason: 'Verify the proposed guard.', primaryOutput: 'SMOKE_PRIMARY_DRAFT: verify the empty-list guard.\n' + 'Bounded draft detail. '.repeat(600) + 'SMOKE_PRIMARY_TAIL_MUST_BE_OMITTED' } });
+  const lessonWorkflow = structuredClone(context.workflow);
+  lessonWorkflow.settings.lessons = [
+    { id: 'lesson-enabled', text: 'SMOKE_CURATED_LESSON: preserve verified evidence', nodeIds: [context.node.id], enabled: true },
+    { id: 'lesson-disabled', text: 'SMOKE_DISABLED_LESSON', nodeIds: [], enabled: false },
+    { id: 'lesson-other', text: 'SMOKE_OTHER_AGENT_LESSON', nodeIds: ['another-agent'], enabled: true },
+  ];
+  const supervisorReport = await executor({ ...context, workflow: lessonWorkflow, upstreamResults: [sourceResult],
+    correction: { attempt: 2, gateNodeId: 'smoke-gate', reasons: ['SMOKE_CORRECTION_REASON'], previousOutput: 'SMOKE_PRIOR_REPORT\n' + 'Prior detail. '.repeat(1000) + 'SMOKE_PRIOR_TAIL_MUST_BE_OMITTED' },
+    escalation: { originalModelId: 'primary-model', reason: 'Verify the proposed guard.', primaryOutput: 'SMOKE_PRIMARY_DRAFT: verify the empty-list guard.\n' + 'Bounded draft detail. '.repeat(600) + 'SMOKE_PRIMARY_TAIL_MUST_BE_OMITTED' } });
   if (requestFailure) throw requestFailure;
   assert.equal(supervisorReport.output, 'Verified supervisor answer.');
-  console.log('PASS: the actual Pi supervisor prompt receives a bounded primary draft as application data and preserves the independent predecessor handoff.');
+  console.log('PASS: the actual Pi supervisor prompt receives scoped enabled lessons, bounded correction evidence and primary draft, and preserves the independent predecessor handoff.');
   mode = 'codemode';
   console.log('Direct-only regression passed. Starting an actual two-cycle Code Mode workflow.');
   // Omitted codeMode preserves the default for workflows saved before this setting existed.
